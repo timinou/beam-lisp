@@ -144,6 +144,13 @@ After runtime checks pass, regenerate and qualify the real floor once.
 
 ## Checkout startup caches
 
+An application can use its existing deployment mode for the native startup
+barrier. For example, `:loading {:environment-env "APP_MODE"
+:production-values ["live"] :package-env "APP_PACKAGE"}` preloads libraries
+when `APP_MODE=live`, while development stays lazy. The default production
+values remain `production` and `prod`. This avoids maintaining a second
+environment variable just to translate the application's production spelling.
+
 Dependency path discovery runs in the native loader. Project loading-policy
 validation is independent of application preparation; JSON support loads when
 JSON output is requested.
