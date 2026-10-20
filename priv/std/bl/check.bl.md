@@ -61,11 +61,14 @@ you own.
       (includes? p "/test/fixtures/")))
 
 (defn collect-paths
-  "Expand PATH arguments into the sources a check reads, in order, dropping the
-   directories a gate never looks at."
+  "Expand targets, pruning excluded directories before reading their children."
   [args]
-  (into [] (filter (fn [p] (not (skipped-path? p)))
-                   (mapcat u/expand-targets (map u/resolve args)))))
+  (into []
+    (filter (fn [p] (not (skipped-path? p)))
+      (mapcat (fn [p]
+                (u/expand-targets p
+                  (fn [dir] (not (skipped-path? (str dir "/"))))))
+              (map u/resolve args)))))
 ```
 
 ## One source, every proven fact
@@ -115,12 +118,19 @@ keeps the cost one analysis per file instead of one per function.
   [path src]
   (let [digest (sha256 src)]
     (try
-      (let [ns (u/ns-of src)
-            fns (into [] (map fn-facts (lsp/document-symbols src)))
+      (let [_ (BeamLisp.Loader/with_loading_session
+                (fn []
+                  (doseq [namespace ["bl.lint" "deodorant" "rewrite" "span-rewrite"]]
+                    (BeamLisp.Loader/ensure_loaded namespace))))
+            rules (vec (deodorant/all-rules))
+            ns (u/ns-of src)
+            document (lsp/check-document src ns)
+            bundle (:analysis document)
+            fns (into [] (map fn-facts (lsp/function-summaries* bundle)))
             with (fn [k] (into [] (map (fn [f] (:name f)) (filter (fn [f] (get f k)) fns))))]
         {:path path :sha digest :unreadable false
-         :diagnostics (count (lsp/diagnostics src ns))
-         :smells (lint/smell-count (deodorant/all-rules) src)
+         :diagnostics (count (:diagnostics document))
+         :smells (lint/smell-count-forms rules src (:forms bundle))
          :fns (count fns)
          :pure (count (filter (fn [f] (:pure f)) fns))
          :terminates (count (filter (fn [f] (:terminates f)) fns))
@@ -353,6 +363,11 @@ code carries the verdict.
    Exit 0 when nothing regressed, 1 when something did, 2 on a usage error."
   [args st]
   (u/register-paths st)
+  ;; Publishing the output encoder after analysis would invalidate the first
+  ;; document's definition context and waste its freshly computed result.
+  (when (:json st)
+    (doseq [namespace ["bl.json" "bl.json-native"]]
+      (BeamLisp.Loader/ensure_loaded namespace)))
   (if (:install-hook st)
     (install-hook st)
     (let [targets (if (empty? args) ["."] args)

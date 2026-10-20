@@ -15,6 +15,8 @@ import time
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root', default=Path(__file__).resolve().parents[2], type=Path)
+parser.add_argument('--max-start-seconds', type=float,
+                    help='fail if starting and answering the first request exceeds this budget')
 args = parser.parse_args()
 launcher = str(args.root.resolve() / 'bin/bl')
 with tempfile.TemporaryDirectory(prefix='bl-checkout-transport-') as scratch:
@@ -24,6 +26,7 @@ with tempfile.TemporaryDirectory(prefix='bl-checkout-transport-') as scratch:
     (project / 'env.bl').write_text('{:name "checkout-transport-test" :schedules '
                                     '[{:id "not-started" :every [1 :hours] :run "unused/run"}]}')
     (project / 'value.bl').write_text('(println "VALUE 1")')
+    (project / 'analysis.bl').write_text('(ns transport.analysis) (defn answer [x] (+ x 1))')
     (project / 'argv.bl').write_text('(println (str "ARGS " (count (BeamLisp/argv)) " " (Enum/join (BeamLisp/argv) "|")))')
     (project / 'index.bl.md').write_text('# Checkout transport\n')
     nested = project / 'nested'
@@ -41,6 +44,9 @@ with tempfile.TemporaryDirectory(prefix='bl-checkout-transport-') as scratch:
                                 text=True, capture_output=True, timeout=420 if label == "first" else 180)
         timings[label] = round(time.monotonic() - start, 3)
         print(f"{label}: {timings[label]}s", file=sys.stderr, flush=True)
+        if success and result.returncode:
+            for log in project.rglob('*.log'):
+                print(f"{log.name}:\n{log.read_text(errors='replace')[-12000:]}", file=sys.stderr)
         assert (result.returncode == 0) == success, (label, result.stdout, result.stderr)
         return result.stdout
 
@@ -76,8 +82,15 @@ with tempfile.TemporaryDirectory(prefix='bl-checkout-transport-') as scratch:
                 assert (group / 'memory.max').read_text().strip() == str(4 * 1024**3)
                 assert (group / 'memory.swap.max').read_text().strip() == str(512 * 1024**2)
         assert '3' in run('eval', 'eval', '(+ 1 2)').splitlines()
-        lazy_probe = '(println (and (= false (code/is_loaded :Elixir.BeamLisp.Ns.Vm.Sched)) (= false (code/is_loaded :Elixir.BeamLisp.Ns.Vm.Http)) (= false (code/is_loaded :Elixir.BeamLisp.Ns.Vm.Inspect))))'
+        lazy_probe = '(println (and (= false (code/is_loaded :Elixir.BeamLisp.Ns.Vm.Sched)) (= false (code/is_loaded :Elixir.BeamLisp.Ns.Vm.Http)) (= false (code/is_loaded :Elixir.BeamLisp.Ns.Vm.Inspect)) (= false (code/is_loaded :Elixir.BeamLisp.Ns.Code.Index))))'
         assert 'true' in run('lazy-session', 'eval', lazy_probe).splitlines()
+        checked = run('first-sdk-check', 'check', 'analysis.bl', '--json')
+        assert '"unreadable": false' in checked or '"unreadable":false' in checked, checked
+        run('repeat-sdk-check', 'check', 'analysis.bl', '--json')
+        analysis_lazy = ('(println (and (= false (code/is_loaded :Elixir.BeamLisp.Ns.Codebase)) '
+                         '(= false (code/is_loaded :Elixir.BeamLisp.Ns.System.Linear)) '
+                         '(= false (code/is_loaded :Elixir.BeamLisp.Ns.Z3))))')
+        assert 'true' in run('analysis-stays-light', 'eval', analysis_lazy).splitlines()
         assert 'true' in run('unset-environment', 'eval',
                              '(println (nil? (System/get_env "BL_TRANSPORT_TEST_VALUE")))').splitlines()
         for value in ['first-client', 'second-client']:
@@ -112,8 +125,20 @@ with tempfile.TemporaryDirectory(prefix='bl-checkout-transport-') as scratch:
         assert 'VALUE 2' in run('source-after', 'run', 'value.bl').splitlines()
         updated = owner('after-edit')
         assert owner('after-edit-nested', cwd=nested) == updated
-        assert updated != first, 'edited sources used the old VM'
-        print(json.dumps({'same_owner': True, 'source_edit_restarted': True,
+        assert updated == first, 'a project edit discarded the compiler VM'
+        provider = project / 'transport/value.bl'
+        provider.parent.mkdir()
+        provider.write_text('(ns transport.value) (defn value [] 1)')
+        query = ('(BeamLisp.Loader/ensure_loaded "transport.value") '
+                 '(println (str "PROVIDER " (BeamLisp.Ns.Rt/invoke '
+                 '(BeamLisp.Env/fetch_exact! "transport.value" "value") (list))))')
+        assert 'PROVIDER 1' in run('provider-before', 'eval', query).splitlines()
+        provider.write_text('(ns transport.value) (defn value [] 2)')
+        assert 'PROVIDER 2' in run('provider-after', 'eval', query).splitlines()
+        assert owner('after-provider-edit') == first, 'provider replacement discarded the compiler'
+        print(json.dumps({'same_owner': True, 'source_edit_reused_runtime': True,
                           'owner': first, 'updated_owner': updated, 'seconds': timings}), flush=True)
+        if args.max_start_seconds is not None:
+            assert timings['first'] <= args.max_start_seconds, timings
     finally:
         cleanup()

@@ -1,0 +1,133 @@
+; Bounded emission diagnostics. Build small subtree hints once, then verify
+; exact alpha identity only for collisions. Ordinary deep IR never rehashes its
+; ancestors, and a duplicate root subsumes its descendants' redundant reports.
+(ns system.emission
+  (:require [system.ir :as ir] [system.ir.identity :as identity]))
+
+(def unpositioned-resolution 9)
+
+(defn- own-span [n]
+  (let [a (:ann n)]
+    (when (and (map? a) (int? (:line a)))
+      [(:line a) (:col a) (:end-line a) (:end-col a)])))
+
+(defn- walkable? [n]
+  (and (map? n) (or (contains? n :op) (contains? n :pats) (contains? n :pop))))
+
+(defn- earlier [a b]
+  (cond (nil? a) b (nil? b) a (erlang/< a b) a :else b))
+(defn- later [a b]
+  (cond (nil? a) b (nil? b) a (erlang/> a b) a :else b))
+
+(defn- combine [children]
+  (reduce (fn [a c]
+            {:size (+ (:size a) (:size c))
+             :lo (earlier (:lo a) (:lo c)) :hi (later (:hi a) (:hi c))})
+          {:size 0 :lo nil :hi nil} children))
+
+(defn- hints [root min-size]
+  (let [fold (fn fold [x state]
+          (let [node? (ir/node? x)
+                start (when node? (inc (:serial state)))
+                state (if node? (assoc state :serial start) state)
+                [children state]
+                (cond
+                  (walkable? x)
+                  (reduce (fn [[out state] [k v]]
+                            (let [[hint state]
+                                  (cond
+                                    (and (= k :name)
+                                         (or (= :var (:op x)) (= :let (:op x)) (= :pvar (:pop x))))
+                                    [{:hash :local :size 0} state]
+                                    (= k :val) [{:hash (erlang/phash2 [:literal v]) :size 0} state]
+                                    :else (fold v state))]
+                              [(conj out [k hint]) state]))
+                          [[] state] (dissoc x :ann))
+                  (or (list? x) (vector? x))
+                  (reduce (fn [[out state] child]
+                            (let [[hint state] (fold child state)] [(conj out hint) state]))
+                          [[] state] x)
+                  :else [[] state])
+                parts (if (walkable? x) (map second children) children)
+                inherited (combine parts)
+                span (when node? (own-span x))
+                size (+ (if node? 1 0) (:size inherited))
+                lo (earlier span (:lo inherited)) hi (later span (:hi inherited))
+                shape (cond
+                        (walkable? x) [:ir (into {} (map (fn [[k c]] [k (:hash c)]) children))]
+                        (list? x) [:list (mapv :hash children)]
+                        (vector? x) [:vector (mapv :hash children)]
+                        :else [:value x])
+                hash (erlang/phash2 shape)
+                state (if (and node? (>= size (if lo min-size (max min-size unpositioned-resolution))))
+                        (update state :groups
+                          (fn [groups]
+                            (update groups [hash size lo hi]
+                              (fn [xs] (conj (or xs []) {:node x :size size :start start :end (:serial state)})))))
+                        state)]
+            [{:hash hash :size size :lo lo :hi hi} state]))
+        [_ state] (fold root {:serial 0 :groups {}})]
+    {:nodes (:serial state)
+     :groups (sort-by (fn [g] (- (:size (first g))))
+                      (filter (fn [g] (> (count g) 1)) (vals (:groups state))))}))
+
+(defn- spans [root]
+  (loop [pending [root] found #{}]
+    (if (empty? pending) (if (empty? found) :unpositioned (sort found))
+      (let [n (peek pending) rest (pop pending)]
+        (recur (into rest (ir/child-nodes n))
+               (if-let [span (own-span n)] (conj found span) found))))))
+
+(defn duplicate-report
+  "Maximal witnesses plus mechanical work counts. Hint construction visits each
+   node once; exact candidates are charged at most 64 times that many nodes.
+   Ambiguous adversarial input returns complete? false, never a false proof."
+  ([root] (duplicate-report root 3 nil))
+  ([root min-size] (duplicate-report root min-size nil))
+  ([root min-size verification-limit]
+   (let [index (hints root min-size)
+         limit (or verification-limit (* 64 (:nodes index)))]
+     (loop [groups (:groups index) covered #{} work 0 out []]
+       (if (empty? groups)
+         {:duplicates out :nodes (:nodes index) :verification-nodes work :budget limit :complete? true}
+         (let [candidates (remove (fn [c] (contains? covered (:start c))) (first groups))
+               cost (reduce + 0 (map :size candidates))]
+           (if (> (+ work cost) limit)
+             {:duplicates out :nodes (:nodes index) :verification-nodes work :budget limit :complete? false}
+             (let [exact (vals
+                           (reduce (fn [m c]
+                                     (let [key [(identity/body-identity (:node c)) (spans (:node c))]]
+                                       (update m key (fn [xs] (conj (or xs []) c))))) {} candidates))
+                   twins (filter (fn [xs] (> (count xs) 1)) exact)
+                   found (mapv (fn [xs]
+                                 (let [c (first xs)]
+                                   {:hash (identity/body-hash (:node c)) :span (spans (:node c))
+                                    :count (count xs) :size (:size c) :sample (identity/strip-ann (:node c))})) twins)
+                   covered (reduce (fn [s c] (into s (range (:start c) (inc (:end c)))))
+                                   covered (mapcat identity twins))]
+               (recur (rest groups) covered (+ work cost) (into out found))))))))))
+
+(defn duplicates
+  ([root] (duplicates root 3))
+  ([root min-size]
+   (let [report (duplicate-report root min-size)]
+     (when-not (:complete? report)
+       (throw (ex-info "Emission analysis exceeded its verification budget" {:kind :emission-analysis-limit})))
+     (:duplicates report))))
+
+(defn diagnostics-bodies [bodies]
+  (into []
+    (mapcat (fn [[name d]]
+      (mapcat (fn [c]
+        (let [report (duplicate-report (:body c)) ds (:duplicates report)
+              ann (or (get-in c [:body :ann]) {})]
+          (concat
+            (when-not (:complete? report)
+              [{:kind :analysis-limit :fn name :line (get ann :line 0) :col (get ann :col 0)
+                :msg (str name ": emission analysis reached its verification budget")}])
+            (when (and (seq ds) (not= "<top>" name))
+              (let [worst (first ds)]
+                [{:kind :non-linear-emission :fn name :line (get ann :line 0) :col (get ann :col 0)
+                  :msg (str name ": emitted IR duplicates a " (:size worst) "-node subtree ×" (:count worst)
+                            " — a macro or constructor splices a compiled child more than once")}])))))
+        (ir/program-clauses d))) bodies)))

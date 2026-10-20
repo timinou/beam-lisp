@@ -40,13 +40,17 @@ running a test loop is enough to push it there.
 ### Checkout commands reuse a warm VM
 
 `./bin/bl` uses the native transport and starts one VM for its tree by default.
-Requests carry their own cwd, argv and environment. Source changes invalidate
-that VM before the next request. Automatic VMs skip dashboards and project
-schedules and remain running until explicitly stopped; use
+Requests carry their own cwd, argv and environment. Runtime source changes
+replace that VM before the next request. Project edits keep the compiler VM:
+pure document analysis reuses its environment and content caches; a realm that
+has executed project definitions retires before running changed code. Automatic
+VMs skip dashboards and project schedules and remain running until stopped; use
 `./bin/bl realm stop` to stop it explicitly.
 
 Use `./bin/bl --cold ...` when a check needs a fresh VM. The first command and
-commands after source edits still pay runtime startup. Keep test daemons in a
+commands after runtime edits pay startup. Project edits pay for changed analysis
+or project definitions. Opening a realm leaves its source index cold; index
+consumers build it on demand. Keep test daemons in a
 private runtime directory, cap the whole test process tree, and stop them in
 cleanup. See `test/scripts/checkout_transport.py`.
 

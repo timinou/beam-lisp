@@ -130,16 +130,17 @@ the user meant.
   "FILE → [FILE]; DIR → every loader source under it, sorted, hidden entries
    skipped. A file that is not a loader source expands to nothing, so a command
    maps this over mixed arguments and acts on exactly the sources."
-  [p]
-  (cond
-    (File/regular? p) (if (source-file? p) [p] [])
-    (File/dir? p)
-    (->> (File/ls! p)
-         (filter (fn [n] (not (starts-with? n "."))))
-         (sort-by identity)
-         (map (fn [n] (str p "/" n)))
-         (mapcat expand-targets))
-    :else []))
+  ([p] (expand-targets p (fn [_] true)))
+  ([p descend?]
+   (cond
+     (File/regular? p) (if (source-file? p) [p] [])
+     (and (File/dir? p) (descend? p))
+     (->> (File/ls! p)
+          (filter (fn [n] (not (starts-with? n "."))))
+          (sort-by identity)
+          (map (fn [n] (str p "/" n)))
+          (mapcat (fn [child] (expand-targets child descend?))))
+     :else [])))
 
 (defn join-args
   "bl eval '(+ 1' '2)' — join leftover positionals into one expression."

@@ -1,0 +1,99 @@
+(ns sdk-image-metadata-test)
+
+(defn fixture [f]
+ (let [module :Elixir.BeamLisp.SDKMetadataCacheFixture
+       beam (BeamLisp.Emit/compile_descriptor
+              (BeamLisp.Emit/descriptor_for module
+               (list (BeamLisp.Emit/function_clause :value (BeamLisp.Emit/lit :metadata-fixture)))))
+       bytes (elem beam 1) identity (Atom/to_string module)
+       imports (Enum/uniq (Enum/map
+          (Keyword/get (elem (elem (beam_lib/chunks bytes (list :imports)) 1) 1) :imports)
+          (fn [entry] (Atom/to_string (elem entry 0)))))
+       root (Path/join (System/tmp_dir!) (str "bl-image-metadata-" (erlang/unique_integer (list :positive))))
+       priv (Path/join root "priv") ebin (Path/join root "ebin")
+       file (Path/join ebin (str identity ".beam"))
+       row {:role :stable-body :imports imports :sha256 (crypto/hash :sha256 bytes)}]
+  (File/mkdir_p! priv) (File/mkdir_p! ebin) (File/write! file bytes)
+  (code/load_binary module (String/to_charlist file) bytes)
+  (try (f {:root priv :file file :identity identity :row row :bytes bytes :module module})
+   (finally (code/delete module) (code/purge module) (File/rm_rf! root)))))
+(defn refused [f] (try (f) :accepted (catch _ :refused)))
+
+(deftest image-metadata-decodes-once-but-rereads-and-authenticates-every-artifact
+ (fixture (fn [{:keys [root file identity row bytes]}]
+  (let [pattern (tuple :beam_lib :chunks 2)]
+   (try
+    (erlang/trace_pattern pattern true (list :local :call_count))
+    (let [first (BeamLisp.AOT/image_sdk_entry! root identity row)
+          initial (elem (erlang/trace_info pattern :call_count) 1)
+          again (BeamLisp.AOT/image_sdk_entry! root identity row)
+          repeated (elem (erlang/trace_info pattern :call_count) 1)]
+     (is (= :stable-body (:role first)))
+     (is (= first again))
+     (is (> initial 0))
+     (is (= initial repeated))
+     ;; A public descriptor cannot reuse another descriptor's successful decode.
+     (is (not (empty? (:imports row))))
+     (is (= :refused (refused #(BeamLisp.AOT/image_sdk_entry! root identity (assoc row :imports [])))))
+     (let [rejected (elem (erlang/trace_info pattern :call_count) 1)]
+      (is (= first (BeamLisp.AOT/image_sdk_entry! root identity row)))
+      (is (= rejected (elem (erlang/trace_info pattern :call_count) 1)))
+     ;; Same path/descriptor after a byte change must fail before using the memo.
+     (File/write! file (str bytes "changed"))
+     (is (= :refused (refused #(BeamLisp.AOT/image_sdk_entry! root identity row))))
+     (is (= rejected (elem (erlang/trace_info pattern :call_count) 1)))
+     (File/write! file bytes)
+     (is (= first (BeamLisp.AOT/image_sdk_entry! root identity row)))
+     ;; A claimed cache VALUE is not an input to the fixed native decoder.
+     (is (= :refused (refused #(BeamLisp.Env/sdk_image_metadata! identity row {:role :stable-body}))))
+     (is (= first (BeamLisp.AOT/image_sdk_entry! root identity row)))))
+    (finally (erlang/trace_pattern pattern false (list :local :call_count))))))))
+
+(deftest inventory-row-lookups-decode-once-and-refuse-invalid-replacements
+ (let [key (BeamLisp.AOTCache/compiler_key)
+       bytes (fn [row] (erlang/term_to_binary
+                        {:version 2 :identities :binary :compiler-key key :modules {"fixture" row}}))
+       first (bytes {:marker 1}) changed (bytes {:marker 2})
+       invalid (erlang/term_to_binary {:version 2 :identities :binary :compiler-key "wrong" :modules {}})
+       pattern (tuple :Elixir.BeamLisp.AOT :decode_sdk_inventory! 1)]
+  (try
+   (erlang/trace_pattern pattern true (list :local :call_count))
+   (doseq [_ (range 20)]
+    (is (= {:marker 1} (BeamLisp.Env/sdk_inventory_metadata! first "fixture"))))
+   (is (= (tuple :call_count 1) (erlang/trace_info pattern :call_count)))
+   (is (= {"fixture" {:marker 1}} (BeamLisp.Env/sdk_inventory_metadata! first nil)))
+   (is (nil? (BeamLisp.Env/sdk_inventory_metadata! first "absent")))
+   (is (= (tuple :call_count 1) (erlang/trace_info pattern :call_count)))
+   (is (= {:marker 2} (BeamLisp.Env/sdk_inventory_metadata! changed "fixture")))
+   (is (= (tuple :call_count 2) (erlang/trace_info pattern :call_count)))
+   (is (= :refused (refused #(BeamLisp.Env/sdk_inventory_metadata! invalid "fixture"))))
+   (let [after-refusal (erlang/trace_info pattern :call_count)]
+    (is (= {:marker 2} (BeamLisp.Env/sdk_inventory_metadata! changed "fixture")))
+    (is (= after-refusal (erlang/trace_info pattern :call_count))))
+   (finally (erlang/trace_pattern pattern false (list :local :call_count))))))
+
+(deftest inventory-file-cache-observes-new-bytes-with-preserved-mtime
+ (let [root (Path/join (System/tmp_dir!) (str "bl-inventory-bytes-" (erlang/unique_integer (list :positive))))
+       path (Path/join root "sdk-code.term")
+       bytes (fn [marker] (erlang/term_to_binary
+                {:version 2 :identities :binary :compiler-key (BeamLisp.AOTCache/compiler_key)
+                 :modules {"fixture" {:marker marker}}}))]
+  (try
+   (File/mkdir_p! root)
+   (File/write! path (bytes 1))
+   (let [before (File/stat! path)]
+    (is (= {"fixture" {:marker 1}} (BeamLisp.AOT/inventory_term path)))
+    (File/write! path (bytes 2))
+    (File/touch! path (:mtime before))
+    (is (= {"fixture" {:marker 2}} (BeamLisp.AOT/inventory_term path))))
+   (finally (File/rm_rf! root)))))
+
+(deftest each-complete-unit-check-captures-one-fresh-inventory
+ (let [pattern (tuple :Elixir.BeamLisp.AOT :sdk_inventory_input 0)]
+  (try
+   (erlang/trace_pattern pattern true (list :local :call_count))
+   (is (BeamLisp.AOT/sdk_unit_compiled? "proc.owner-registry"))
+   (is (= (tuple :call_count 1) (erlang/trace_info pattern :call_count)))
+   (is (BeamLisp.AOT/sdk_unit_compiled? "proc.owner-registry"))
+   (is (= (tuple :call_count 2) (erlang/trace_info pattern :call_count)))
+   (finally (erlang/trace_pattern pattern false (list :local :call_count))))))
