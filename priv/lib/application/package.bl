@@ -7,9 +7,18 @@
 (defn- native-identity []
  (into {} (map (fn [path] [(Path/basename path) (digest (File/read! path))])
               (sort (Path/wildcard (str (BeamLisp.Tiers/priv_root) "/native/*.so"))))))
+(defn- sdk-identity []
+ (let [root (BeamLisp.Tiers/priv_root) inventory (Path/join root "sdk-code.term")]
+  (if (File/regular? inventory)
+   {:inventory (digest (File/read! inventory))}
+   ;; A source checkout has no sealed inventory. Bind its actual tier bytes,
+   ;; including library changes that do not rotate the compiler identity.
+   {:sources (digest (erlang/term_to_binary
+     (mapv (fn [path] [(Path/relative_to path root) (digest (File/read! path))])
+      (sort (BeamLisp.Tiers/sources root)))))})))
 (defn runtime-identity []
  {:compiler (BeamLisp.AOTCache/compiler_key) :erts (erlang/list_to_binary (erlang/system_info :version))
-  :elixir (System/version) :native (native-identity)
+  :elixir (System/version) :native (native-identity) :sdk (sdk-identity)
   ;; Only exact pinned host modules belong here. Core/Rt are namespace shims:
   ;; loading the test prelude, for example, adds core exports and re-emits its
   ;; shim without changing the compiler ABI. Boot source/codegen identity is
@@ -50,9 +59,10 @@
      (if (contains? units n) (recur (rest pending) units)
       (let [source (BeamLisp.Loader/source_content n)
             [declared deps] (when source (plan/header-for n source))]
-       (when (not= n declared) (throw (ex-info "Application dependency source unavailable" {:namespace n})))
+       (when (not= n declared) (throw (ex-info (str "Application dependency source unavailable: " n) {:namespace n})))
        (recur (concat deps (rest pending))
-        (assoc units n {:source source :requires (vec deps) :artifact? (replayable? source)})))))))))
+        (assoc units n {:source source :requires (vec deps) :artifact? (replayable? source)
+                        :sdk? (= :tier (:home (BeamLisp.Loader/namespace_context n)))})))))))))
 (defn- inventory [root]
  (let [paths (Path/wildcard (str root "/**/*") (list (tuple :match_dot true)))]
   (reduce (fn [files path]
@@ -66,13 +76,19 @@
           {} paths)))
 (defn- source-path [n] (str "source/" (String/replace n "." "/") ".bl"))
 (defn- shape? [m]
- (let [names (:namespaces m) artifacts (:artifacts m) fallback (:source-fallback m)]
+ (let [names (:namespaces m) artifacts (:artifacts m) fallback (:source-fallback m)
+       sdk (:sdk-sources m)
+       name-set (when (vector? names) (set names))
+       artifact-set (when (vector? artifacts) (set artifacts))]
   (and (vector? names) (<= (count names) 10000) (every? namespace? names)
        (= names (vec (sort (distinct names))))
        (vector? artifacts) (vector? fallback)
        (= names (vec (sort (concat artifacts fallback))))
-       (empty? (filter (fn [n] (contains? (set artifacts) n)) fallback))
+       (empty? (filter (fn [n] (contains? artifact-set n)) fallback))
        (string? (:entry-hash m)) (vector? (:roots m)) (every? namespace? (:roots m))
+       (map? sdk) (<= (count sdk) 10000)
+       (every? (fn [[n sha]] (and (namespace? n) (string? sha) (= 64 (count sha))
+                                (not (contains? name-set n)))) sdk)
        (map? (:files m))
        (every? (fn [n] (string? (get (:files m) (source-path n)))) names))))
 (defn verify!
@@ -94,6 +110,12 @@
    (throw (ex-info "Application package identity or inventory mismatch" {:kind :application-package})))
   (when (and (= 2 (:format manifest)) (not (realm-manifest? manifest)))
     (throw (ex-info "Invalid realm package authority" {:kind :application-package-realm})))
+  ;; An application must keep using the SDK's actual provider. A same-named
+  ;; project file cannot replace that provider after the package was built.
+  (doseq [[n sha] (:sdk-sources manifest)]
+   (when-not (and (= :tier (:home (BeamLisp.Loader/namespace_context n)))
+                  (= sha (digest (BeamLisp.Loader/source_content n))))
+    (throw (ex-info "Application package SDK dependency changed" {:kind :application-package-sdk :namespace n}))))
   manifest))
 (defn- realm-manifest? [m]
  (and (map? (:realm m)) (string? (:key (:realm m))) (map? (:decl (:realm m)))
@@ -139,16 +161,33 @@
              (-> result (update :built inc) (assoc-in [:modules n] modules)))))
          {:built 0 :modules {}} (sort-by first units)))
 
+(defn with-source-root
+ "Resolve one frozen application source root followed by the actual SDK
+  tiers. Preserve this context for deferred requires; do not rehost SDK code
+  or fall back to a producer's live application directories."
+ [source-root action]
+ (let [dirs (into [source-root] (BeamLisp.Tiers/dirs))
+       run (reduce (fn [next dir] (fn [] (BeamLisp.Loader/with_load_path dir next)))
+             action (butlast dirs))]
+  (BeamLisp.Loader/with_search_dir (last dirs) run)))
+
 (defn- build-unit!
  "Create a new immutable package directory. Compile supported library units;
   retain sources for all units so unsupported top-level effects replay normally.
   Existing destinations are refused. Build in an isolated release environment."
  [entry out roots]
- (BeamLisp.Loader/ensure_loaded "build")
+ ;; The producer is an explicit build command. Its trusted driver comes from
+ ;; this SDK, even when the caller has narrowed its application search roots.
+ (BeamLisp.Loader/with_search_dir (Path/join (BeamLisp.Tiers/priv_root) "build")
+  (fn [] (BeamLisp.Loader/ensure_loaded "build")))
  (when (File/exists? out) (throw (ex-info "Application package already exists" {:path out})))
  (let [entry-source (BeamLisp.Loader/read_source entry)
        realm (BeamLisp.Loader/realm_context)
-       original (closure entry-source roots)
+       discovered (closure entry-source roots)
+       sdk-sources (into {} (keep (fn [[n unit]] (when (:sdk? unit) [n (digest (:source unit))])) discovered))
+       ;; SDK code already has authenticated compiler products in the image.
+       ;; Moving it under an application source root destroys that authority.
+       original (into {} (remove (fn [[_ unit]] (:sdk? unit)) discovered))
        homes (when realm (into {} (map (fn [[n _]] [n (BeamLisp.Loader/namespace_context n)]) original)))
        authority (when realm (compiler-authority))
        _ (when (and realm (nil? authority))
@@ -171,7 +210,7 @@
                          (File/mkdir_p! (Path/dirname path)) (File/write! path (:source unit))
                          (when (:artifact? unit) path))) (sort-by first units))
          result (if realm (realm-compile! units ebin homes)
-                   (BeamLisp.Loader/with_search_dir source-root
+                   (with-source-root source-root
                     (fn [] (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "build" "run")
                       (list {:sources (filterv some? sources) :out ebin :jobs 1})))))
          _ (when realm
@@ -183,14 +222,15 @@
                          (not= (get homes n) (BeamLisp.Loader/namespace_context n)))
                  (throw (ex-info "Realm provider changed while packaging" {:namespace n})))))
          manifest {:format (if realm 2 FORMAT) :runtime (runtime-identity) :caps (BeamLisp.Env/caps)
-                   :entry-hash (digest entry-source) :roots (vec (sort (distinct roots)))
+                   :entry-hash (digest entry-source) :roots (vec (sort (distinct roots))) :sdk-sources sdk-sources
                    :namespaces (vec (sort (keys units)))
                    :artifacts (vec (sort (map first (filter (fn [[_ u]] (:artifact? u)) units))))
                    :source-fallback (vec (sort (map first (remove (fn [[_ u]] (:artifact? u)) units))))}]
     (let [manifest (if realm
                      (assoc manifest :realm realm :homes homes :closures closures
                             :compiler-authority authority :local-modules (:modules result)) manifest)]
-    (when (seq (:errors result)) (throw (ex-info "Application package compilation failed" result)))
+    (when (seq (:errors result))
+     (throw (ex-info (str "Application package compilation failed: " (pr-str (vec (take 3 (:errors result))))) result)))
     ;; Build bookkeeping is not needed at runtime and is not shipped.
     (doseq [path (Path/wildcard (str ebin "/*"))]
      (when (not (String/ends_with? path ".beam")) (File/rm! path)))
