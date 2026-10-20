@@ -156,7 +156,7 @@ let
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
-      ../bin ../priv ../env.bl ../bl.lock
+      ../bin ../priv ../env.bl ../bl.lock ../scripts/prepare-release.bl
       ../native/bl_json ../native/code_embed ../native/datom_datalog
       ../native/datom_fjall ../native/datom_vector ../native/lazy_memo
       ../tooling/drop/src ../tooling/drop/Cargo.toml ../tooling/drop/Cargo.lock
