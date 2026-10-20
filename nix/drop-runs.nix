@@ -17,7 +17,7 @@ pkgs.runCommand "bl-drop-runs" {
     -b /nix/store -b "$TMPDIR" -b /dev -b /proc -w "$PWD" \
     ${pkgs.coreutils}/bin/env \
     LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib pkgs.zlib pkgs.ncurses pkgs.openssl pkgs.brotli pkgs.zstd ]} \
-    ./bl.drop eval '(+ 1 2)')
+    ./bl.drop --cold eval '(+ 1 2)')
   [ "$got" = 3 ] || { echo "drop eval = '$got', want 3" >&2; exit 1; }
   touch $out
 ''
