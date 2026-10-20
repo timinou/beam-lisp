@@ -198,8 +198,10 @@ let
       # Bootstrap commands use the source launcher directly. The native
       # transport client is already built in drop-tools; compiling another
       # client here would attempt a crates.io fetch inside the offline sandbox.
-      ./bin/bl --cold deps verify
-      ./bin/bl --cold deps compile
+      # Keep the provisioning verb first: the bare bootstrap can run before
+      # application dependencies exist. bin/bl recognizes --cold anywhere.
+      ./bin/bl deps verify --cold
+      ./bin/bl deps compile --cold
       ./bin/bl --cold run scripts/prepare-release.bl
       # Package the source-validated compiler floor. Compiler regeneration is
       # a bare-VM operation, independent of the runtime's retained SDK lease.
