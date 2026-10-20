@@ -30,6 +30,9 @@ with tempfile.TemporaryDirectory(prefix='bl-sdk-build-cache-') as temporary:
                              :root (str root "/priv") :out out :scope :scoped :jobs 1})]
       (when (seq (:errors result))
         (throw (ex-info "SDK build failed" {:phase phase :result result})))))
+  ; Restoration is artifact-only. Actual semantic use establishes executable
+  ; ownership and initializes the provider through the ordinary loader.
+  (BeamLisp.Loader/ensure_loaded "vm.native")
   (when-not (BeamLisp.AOT/sdk_unit_compiled? "vm.native")
     (throw (ex-info "Cache hit lost the SDK producer" {})))
   (when-not (= :public (BeamLisp.AOT/sdk_declaration_kind "vm.native" "host-module"))

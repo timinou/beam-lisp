@@ -122,6 +122,26 @@
   (Enum/filter (BeamLisp.Tiers/sources root)
     (fn [path] (string? (BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source path))))))
 
+(defn assemble-outputs!
+  "Copy complete verified producer units into a disposable release tree.
+   Verify the bytes being copied against the completed build facts; do not
+   load modules, run initializers, or rewrite the persistent originals."
+  [manifest outputs destination]
+  (File/mkdir_p! destination)
+  (doseq [[source entry] manifest]
+    (let [hashes (into {} (:digests entry))
+          names (blog/module-names (:modules entry))]
+      (when-not (= (count names) (count hashes))
+        (throw (ex-info "Incomplete persistent unit hashes" {:source source})))
+      (doseq [name names]
+        (let [file (str name ".beam")
+              bytes (File/read! (Path/join outputs file))
+              digest (String/downcase (binary/encode_hex (crypto/hash :sha256 bytes)))]
+          (when-not (= digest (get hashes name))
+            (throw (ex-info "Persistent unit changed before assembly" {:source source :module name})))
+          (File/write! (Path/join destination file) bytes)))))
+  (count manifest))
+
 (defn write-precompiled-index!
   "Index complete compiled units by their compiler and source keys. Names are
    data; runtime restoration verifies each selected BEAM before cache adoption."
@@ -243,48 +263,42 @@
          (thunk))))
 
 (defn- build-one-unfenced
-  "Compile `path` (or link it from the shared cache) into `out`.
-   → {:path :key :tkey :closure-key :cached? :result} where result is
-   [:ok modules] or [:error msg].
-
-   Runs in a WORKER process (pmap-ordered). Everything it returns is fully
-   realised before it is sent back: a lazy seq's thunk is a closure over
-   the worker's stack and would be forced in the parent after the worker
-   exited — a `map` here must be `mapv`, and `mods` a vector."
-  [path key tkey cache-key closure-key out log]
+  [path key tkey closure-key out log prepared syntax?]
   (when log (log (str "  " path)))
-  (let [cached (if closure-key (BeamLisp.AOTCache/fetch cache-key closure-key out) :miss)
-        ; fetch → {:ok modules} | :miss
-        hit? (and (erlang/is_tuple cached) (= :ok (erlang/element 1 cached)))
-        result (try
-                 (if hit?
-                   (let [mods (erlang/element 2 cached)
-                         ns (BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source path))]
-                     ; Adopt the complete unit through the runtime's native
-                     ; loader: SDK ownership must exist BEFORE init can call
-                     ; another compiled SDK producer (notably vm.native).
-                     (if ns
-                       (BeamLisp.Loader/with_load_path (Path/dirname path)
-                         (fn [] (BeamLisp.AOT/load_cached_entry ns mods out out)))
-                       ; A bare script owns no SDK namespace to register.
-                       (BeamLisp.AOTCache/run_init_modules mods out))
-                     [:ok (vec mods)])
+  (let [result (try
+                 (if prepared
+                   [:ok (vec (BeamLisp.AOTCache/restore_prepared prepared out))]
                    (let [mods (retry-after-settle
-                               (fn [] (BeamLisp.AOT/compile_file path (list (erlang/list_to_tuple (list :output_dir out))
-                                                              (erlang/list_to_tuple (list :mark_loaded? true))))))]
-                     [:ok (vec (Enum/map (Enum/to_list mods) (fn [m] (erlang/element 1 m))))]))
-                   (catch e
-                     [:error (str "beam-lisp AOT: " path ": " (ex-message e))]))]
-    {:path path :key key :tkey tkey :closure-key closure-key :cached? hit? :result result}))
+                               (fn [] (BeamLisp.AOT/compile_file path
+                                        (list (tuple :output_dir out) (tuple :mark_loaded? true)))))]
+                     [:ok (vec (Enum/map (Enum/to_list mods) (fn [m] (elem m 0))))]))
+                 (catch e [:error (str "beam-lisp AOT: " path ": " (ex-message e))]))]
+    {:path path :key key :tkey tkey :closure-key closure-key
+     :cached? (some? prepared) :result result
+     :replay? (or syntax? (and (= :ok (first result))
+                         (BeamLisp.AOTCache/output_replay_complete? (to-list (second result)) out)))}))
 
-(defn- build-one [path key tkey cache-key closure-key out log]
-  ;; Definitions and SDK receipts share one VM-wide publication generation.
-  ;; Another unit publishing while a declaration is checked makes a valid
-  ;; provider look unavailable. Keep each unit's publication/initialization
-  ;; together; immutable cache entries still avoid source compilation.
-  (global/trans (tuple :bl_build_unit_publication (erlang/self))
-    (fn [] (build-one-unfenced path key tkey cache-key closure-key out log))
-    (list (erlang/node))))
+(defn- prepare-one [path key tkey cache-key closure-key out log]
+  ;; Capture immutable inputs before waiting. Bound preparation by the wave's
+  ;; job window, then publish serially instead of creating local lock contention.
+  (let [syntax? (or (toolchain-source? path (BeamLisp.Tiers/priv_root))
+                    (BeamLisp.Loader/replayable_source? (BeamLisp.Loader/read_source path)))
+        candidate (when cache-key (BeamLisp.AOTCache/prepare_fetch cache-key closure-key))
+        prepared (when (and candidate (or syntax? (BeamLisp.AOTCache/prepared_replay_complete? candidate))) candidate)]
+    {:path path :key key :tkey tkey :closure-key closure-key :out out :log log
+     :prepared prepared :syntax? syntax?}))
+
+(defn- publish-one [input]
+  ;; Keep the entire compilation/publication turn protected. Only immutable
+  ;; preparation moved out; external concurrent builders still use this lock.
+  (let [waiting (erlang/monotonic_time :microsecond)]
+    (global/trans (tuple :bl_build_unit_publication (erlang/self))
+      (fn []
+        (let [wait-us (- (erlang/monotonic_time :microsecond) waiting)]
+          (assoc (build-one-unfenced (:path input) (:key input) (:tkey input)
+                   (:closure-key input) (:out input) (:log input) (:prepared input) (:syntax? input))
+                 :lock-wait-us wait-us)))
+      (list (erlang/node)))))
 
 ; ── parallel wave ────────────────────────────────────────────────────────────
 
@@ -300,7 +314,7 @@
   "Map `f` over `xs` in parallel (at most `n` at once), results in order.
    Plain spawn/receive: one process per element in a chunk, each sending
    `[ref result]` back; collected in chunk order. A crash in `f` is
-   linked, so it surfaces as the build's own failure — `build-one` already
+   linked, so it surfaces as the build's own failure — the publisher already
    catches compile errors into a result, so a crash here is a real bug."
   [n f xs]
   (let [me (erlang/self)
@@ -384,10 +398,11 @@
 
 (defn- result-fact
   "The fact a finished source writes: what it is fresh under, or why it is not."
-  [r]
+  [r out]
   (let [[tag payload] (:result r) path (:path r)]
     (if (= tag :ok)
-      (blog/built-fact path (:key r) (:tkey r) payload (:cached? r))
+      (blog/built-fact path (:key r) (:tkey r) payload (:cached? r)
+                       (blog/artifact-digests out payload))
       (blog/failed-fact path payload))))
 
 (defn- fold-results
@@ -397,7 +412,7 @@
    completed source — and both effects come from the ONE fact list, so what the
    log records and what the state believes cannot drift."
   [st results out log-path]
-  (let [facts (vec (map result-fact results))]
+  (let [facts (vec (map (fn [r] (result-fact r out)) results))]
     (blog/append! log-path facts)
     (reduce (fn [st r]
       (let [[tag payload] (:result r) path (:path r)
@@ -408,7 +423,7 @@
         (doseq [mod (remove (fn [m] (contains? names m)) (blog/module-names old))]
           (delete-beam out mod))
         (if (= tag :ok)
-          (do (when (and (:closure-key r) (not (:cached? r)))
+          (do (when (and (:closure-key r) (:replay? r) (not (:cached? r)))
                 ; Host cache ABI takes an Erlang list. A BL vector is not
                 ; Enumerable there; store's best-effort catch hid the mismatch.
                 (BeamLisp.AOTCache/store (:tkey r) (:closure-key r) out (to-list payload)))
@@ -416,7 +431,8 @@
                   (assoc :built (inc (:built st)))
                   (update (if (:cached? r) :cached :compiled) inc)))
           (assoc st :errors (conj (vec (:errors st)) payload)))))
-      (assoc st :state (blog/apply-facts (:state st) facts))
+      (assoc st :state (blog/apply-facts (:state st) facts)
+                :lock-wait-us (+ (or (:lock-wait-us st) 0) (reduce + 0 (map :lock-wait-us results))))
       results)))
 
 (defn- source-key
@@ -449,17 +465,15 @@
 (defn- build-wave [wave jobs st p todo? cache? hashes out log-path log root]
   (let [state (:state st)
         paths (vec (map :path (filter (fn [n] (todo? state (:path n))) wave)))
-        results (pmap-ordered jobs (fn [path]
-                  (let [tkey (source-key root path)
-                        ; Library/application units use the runtime's replay
-                        ; rule. The boot/build toolchain has its own floor
-                        ; protocol (including the prelude's declaration DSL).
-                        cache-key (when (and cache?
-                                          (or (toolchain-source? path (or root (BeamLisp.Tiers/priv_root)))
-                                              (BeamLisp.Loader/replayable_source?
-                                                (BeamLisp.Loader/read_source path)))) tkey)]
-                    (build-one path (get (:key p) path) tkey cache-key
-                      (when cache-key (get (:key p) path)) out log))) paths)]
+        results (reduce
+                  (fn [acc window]
+                    (let [prepared (pmap-ordered jobs
+                                     (fn [path]
+                                       (let [tkey (source-key root path)]
+                                         (prepare-one path (get (:key p) path) tkey (when cache? tkey)
+                                           (when cache? (get (:key p) path)) out log))) window)]
+                      (into acc (pmap-ordered 1 publish-one prepared))))
+                  [] (chunks-of (max 1 jobs) paths))]
     (fold-results st results out log-path)))
 
 (defn- build-ordinary [waves jobs st p todo? cache? hashes out log-path log root]
@@ -891,7 +905,10 @@
         ; clean run: report it, and do NOT prune — a `:full` run would read
         ; every recorded source as deleted and wipe the manifest.
         all-excluded? (and (not (empty? all-sources)) (not (empty? excl)) (empty? sources))
-        out (:out opts) force? (= true (:force? opts))
+        out (:out opts)
+        _ (File/mkdir_p! out)
+        _ (code/add_patha (String/to_charlist out))
+        force? (= true (:force? opts))
         ; WHAT THIS RUN OWNS. `:full` is the default because it is what every
         ; existing caller means; only an explicit `:scoped` — or a scope we
         ; cannot read, which is reported and answered conservatively — turns
@@ -979,14 +996,18 @@
                                         (not (namespace-output-fresh? (get nodes-by-path path)
                                                (get (:key p) path) (source-key root path) out
                                                (:modules (get (:sources state) path)))))))
-        total (count (filter (fn [n] (todo? state0 (:path n))) (:order p)))]
+        ;; Verify each completed unit once per planning snapshot. Wave dispatch
+        ;; must not reread/hash every artifact a second time.
+        work (set (map :path (filter (fn [n] (todo? state0 (:path n))) (:order p))))
+        todo? (fn [_state path] (contains? work path))
+        total (count work)]
     (when (and log (pos? total)) (log (str "beam-lisp AOT: building " total " source(s)")))
     ; the run fact goes down BEFORE the first source, and into the state with
     ; it: a build killed mid-wave leaves a log that says a run started and how
     ; far it got, and the run that finishes writes itself into the compaction
     (blog/append! lpath [started])
     (let [tc-paths (set (map :path (:toolchain part)))
-          initial {:state (blog/apply-facts state0 [started]) :built 0 :compiled 0 :cached 0 :toolchain-paths tc-paths
+          initial {:state (blog/apply-facts state0 [started]) :built 0 :compiled 0 :cached 0 :lock-wait-us 0 :toolchain-paths tc-paths
                    :errors (vec (concat read-errors cyc-errors (:errors part) scope-errors refuse-errors
                                         (if all-excluded?
                                           ["beam-lisp AOT: :exclude left no sources to build; check :build :exclude"]
@@ -1034,6 +1055,7 @@
       (let [nat (if (:native opts) (build-native (or (:root opts) ".") log)
                                   {:built 0 :cached 0 :artifacts [] :errors []})]
         {:built (:built final) :compiled (:compiled final) :cached (:cached final)
+         :lock-wait-us (:lock-wait-us final)
          :errors (vec (concat (:errors final) (:errors nat)))
          :manifest projection
          :ex-built (:ex-built with-ex)

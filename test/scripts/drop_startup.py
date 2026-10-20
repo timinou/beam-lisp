@@ -35,7 +35,8 @@ def run(command, cwd, env, expected='42', timeout=180):
                             capture_output=True, timeout=timeout)
     if result.returncode:
         raise RuntimeError(result.stdout + result.stderr)
-    assert expected in result.stdout.splitlines(), result.stdout
+    if expected is not None:
+        assert expected in result.stdout.splitlines(), result.stdout
     return time.monotonic() - start, result.stdout
 
 
@@ -159,7 +160,7 @@ BeamLisp.Launcher.start_app!(["run", Path.join(__DIR__, "hello.bl")], %{halt: ha
         # the sealed image. No checkout, staging path or compiler overlay is on
         # the consumer's search path.
         source = Path(__file__).resolve().parents[1] / 'bl'
-        regressions = ['sdk_image_metadata_test.bl', 'sdk_inventory_cache_test.bl',
+        regressions = ['sdk_loading_batch_test.bl', 'sdk_image_metadata_test.bl', 'sdk_inventory_cache_test.bl',
                        'sdk_retention_lock_test.bl', 'code_lease_observation_test.bl',
                        'proc_framework_test.bl',
                        'application_package_sdk_test.bl', 'aot_actor_inventory_test.bl']
@@ -169,7 +170,9 @@ BeamLisp.Launcher.start_app!(["run", Path.join(__DIR__, "hello.bl")], %{halt: ha
             (tests / name).write_bytes((source / name).read_bytes())
         elapsed, output = run([str(artifact), '--cold', 'test',
                                *[str(tests / name) for name in regressions]],
-                              directory, env, expected='0 failures, 0 errors.', timeout=600)
+                              directory, env, expected=None, timeout=600)
+        summary = f'{len(regressions)} file(s) passed, 0 failed, 0 incoherent'
+        assert summary in [line.strip() for line in output.splitlines()], output
         print(output, end='', flush=True)
         print(f'sealed-runtime-regressions: {elapsed:.3f}s', flush=True)
 
