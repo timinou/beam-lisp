@@ -160,7 +160,8 @@ BeamLisp.Launcher.start_app!(["run", Path.join(__DIR__, "hello.bl")], %{halt: ha
         # the consumer's search path.
         source = Path(__file__).resolve().parents[1] / 'bl'
         regressions = ['sdk_image_metadata_test.bl', 'sdk_inventory_cache_test.bl',
-                       'sdk_retention_lock_test.bl', 'proc_framework_test.bl',
+                       'sdk_retention_lock_test.bl', 'code_lease_observation_test.bl',
+                       'proc_framework_test.bl',
                        'application_package_sdk_test.bl', 'aot_actor_inventory_test.bl']
         tests = directory / 'regressions'
         tests.mkdir()
