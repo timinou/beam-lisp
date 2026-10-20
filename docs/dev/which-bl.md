@@ -65,6 +65,11 @@ compiled unit. A fresh runtime verifies and restores the whole unit before
 initializing it. SDK compilation is build work; runtime admission verifies
 source bytes, code identities and ownership evidence.
 
+Build-driver units use their build-tier key and the same complete-unit loader.
+A shipped SDK carries its sealed index rather than a development
+`compile.beam_lisp` file; loading its driver must not fall back to source or
+publish a receipt while its body is still unloaded.
+
 ## Focused runtime host checks
 
 Before runtime host edits, save the seed-matching sources:
