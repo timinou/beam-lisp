@@ -16,10 +16,14 @@ import time
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('drop', type=Path)
 parser.add_argument('--samples', type=int, default=3)
+parser.add_argument('--max-seconds', type=float,
+                    help='fail if any fresh install or cold VM exceeds this wall-clock budget')
 args = parser.parse_args()
 artifact = args.drop.resolve()
 if args.samples < 1:
     parser.error('--samples must be positive')
+if args.max_seconds is not None and args.max_seconds <= 0:
+    parser.error('--max-seconds must be positive')
 
 
 def run(command, cwd, env):
@@ -35,6 +39,7 @@ def run(command, cwd, env):
 with tempfile.TemporaryDirectory(prefix='bl-drop-startup-') as temporary:
     scratch = Path(temporary)
     times = []
+    cold_vm_times = []
     for sample in range(args.samples):
         directory = scratch / str(sample)
         directory.mkdir()
@@ -53,6 +58,11 @@ with tempfile.TemporaryDirectory(prefix='bl-drop-startup-') as temporary:
         elapsed, _ = run([str(artifact), '--cold', 'run', str(hello)], directory, env)
         times.append(round(elapsed, 3))
         print(f'fresh-install-{sample + 1}: {elapsed:.3f}s', flush=True)
+        # Reuse only extracted files: --cold still starts a new BEAM. This
+        # separates VM readiness from the first install's decompression work.
+        elapsed, _ = run([str(artifact), '--cold', 'run', str(hello)], directory, env)
+        cold_vm_times.append(round(elapsed, 3))
+        print(f'cold-vm-{sample + 1}: {elapsed:.3f}s', flush=True)
 
     # Instrument the extracted image before the actual release entry starts
     # the app. Counting calls avoids a trace mailbox and its timing overhead.
@@ -84,4 +94,8 @@ BeamLisp.Launcher.start_app!(["run", Path.join(__DIR__, "hello.bl")], %{halt: ha
     _, output = run(command, directory, env)
     print(next(line for line in output.splitlines() if line.startswith('STARTUP-AOT ')), flush=True)
     print(json.dumps({'fresh_install_seconds': times,
-                      'median_seconds': statistics.median(times)}), flush=True)
+                      'median_seconds': statistics.median(times),
+                      'cold_vm_seconds': cold_vm_times,
+                      'cold_vm_median_seconds': statistics.median(cold_vm_times)}), flush=True)
+    if args.max_seconds is not None:
+        assert max(times + cold_vm_times) <= args.max_seconds, (times, cold_vm_times, args.max_seconds)

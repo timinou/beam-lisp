@@ -1,0 +1,197 @@
+; Source call facts, independent of codebase storage and indexing services.
+; Both arity diagnostics and codebase indexing read these exact same facts.
+(ns system.source (:require [typed] [compiler] [datalog-shape]))
+
+(defn- vocab
+  "`{:loops :reads :callee-name}` from `datalog-shape`, loaded if this Env has
+   not initialised it."
+  []
+  (let [hit (erlang/get :datalog-shape-vocab)]
+    ; `erlang/get` answers :undefined for an unset key, NOT nil — so `some?`
+    ; here would treat "no memo yet" as a hit and hand back :undefined, which
+    ; `get` then reads as a vocabulary of nil: the lint stops firing and
+    ; reports nothing, quietly. (The same trap `oracle.bl:289` documents.)
+    (if (and (some? hit) (not= :undefined hit))
+      hit
+      (let [v (do (try (BeamLisp.Loader/ensure_loaded "datalog-shape")
+                       (catch _ nil))
+                  {:loops datalog-shape/LOOP-HEADS
+                   :reads datalog-shape/STORE-READ-NAMES
+                   :callee-name datalog-shape/callee-name})]
+        (erlang/put :datalog-shape-vocab v)
+        v))))
+
+(def special-heads
+  #{"ns" "def" "fn" "if" "do" "quote" "syntax-quote" "let" "loop" "recur"
+    "throw" "try" "receive" "and" "or" "when" "when-not" "cond" "doseq"
+    "defn" "defn-" "defmacro" "defmulti" "defmethod" "defprotocol"
+    "extend-type" "extend-protocol" "defrecord" "deftype" "reify"
+    "defnative" "defserver" "satisfies?"})
+
+; --- form plumbing (reader nodes; see typed for the shape rules) ------------------
+
+(defn node-form [n] (typed/node-form n))
+(defn node-tag [n] (typed/node-tag n))
+(defn node-items [n] (typed/node-items n))
+(defn node-name [n] (typed/node-name n))
+(defn node-pos [n] (typed/node-pos n))
+
+(defn line-of [n fallback]
+  (let [p (node-pos n)]
+    (if (nil? p) fallback (:line p))))
+
+(declare walk-calls)
+
+(defn walk-children [caller ns-str node acc next-id]
+  (reduce (fn [[a i] sub] (walk-calls caller ns-str sub a i))
+          [acc next-id] (node-items node)))
+
+(defn walk-calls
+  "Every (head …) call under `node`, as facts. `caller` is the
+   enclosing fn name (string). Returns [facts next-id]. Meta wrappers
+   carry the position; the inner list records against the WRAPPER's
+   line (via the :__pos env-style hint, same rule as typed)."
+  [caller ns-str node acc next-id]
+  (walk-calls-at caller ns-str node acc next-id nil))
+
+(defn walk-calls-at
+  ([caller ns-str node acc next-id hint]
+   (walk-calls-at caller ns-str node acc next-id hint 0))
+  ([caller ns-str node acc next-id hint depth]
+  ; `depth` counts the per-element loops (LOOP-HEADS) enclosing `node`:
+  ; the FUNCTION argument of the `map` family and the BODY of `for`/`doseq`
+  ; are walked one level deeper; a loop's collection argument is not.
+  (let [tag (node-tag node)]
+    (cond
+      (= tag :meta)
+        (walk-calls-at caller ns-str (second (erlang/tuple_to_list node))
+                       acc next-id (node-pos node) depth)
+
+      (contains? #{:vector :set} tag)
+        (reduce (fn [[a i] sub] (walk-calls-at caller ns-str sub a i hint depth))
+                [acc next-id] (node-items node))
+
+      (= tag :map)
+        (reduce (fn [[a i] pair]
+                  (let [[a2 i2] (walk-calls-at caller ns-str
+                                            (first (erlang/tuple_to_list pair)) a i hint depth)]
+                    (walk-calls-at caller ns-str
+                                (second (erlang/tuple_to_list pair)) a2 i2 hint depth)))
+                [acc next-id] (node-items node))
+
+      (= tag :list)
+        (let [items (node-items node)
+              head  (node-form (first items))]
+          (cond
+            ; (:k m) is a keyword LOOKUP — a literal key read on a value, no
+            ; call target at all — so it contributes no call fact; its argument
+            ; is still walked for the calls inside it.
+            (= :keyword (node-tag head))
+              (reduce (fn [[a i] sub] (walk-calls-at caller ns-str sub a i hint depth))
+                      [acc next-id] (rest items))
+            (not (= :symbol (node-tag head)))
+            ; ((chooser) x) is an APPLICATION, not just a nested expression.
+            ; Record its unknown target before walking the head/arguments, so
+            ; a dependency cone cannot call an unindexed dynamic invoke pure.
+            (let [p (node-pos node)
+                  line (if (nil? p) (if (nil? hint) 0 (:line hint)) (:line p))
+                  fact {:db/id next-id :call/caller caller
+                        :call/callee "<dynamic>" :call/arity (count (rest items))
+                        :call/line line :call/loop-depth depth}]
+              (reduce (fn [[a i] sub] (walk-calls-at caller ns-str sub a i hint depth))
+                      [(conj acc fact) (+ next-id 1)] items))
+            :else
+            (let [hname (node-name head)
+                  foreign-index (get {"Enum/map" 1 "Enum/each" 1
+                                      "Elixir.Enum/map" 1 "Elixir.Enum/each" 1
+                                      "Enum/reduce" (- (count (rest items)) 1)
+                                      "Elixir.Enum/reduce" (- (count (rest items)) 1)
+                                      "lists/map" 0 "lists/foldl" 0 "lists/foldr" 0}
+                                     hname)
+                  loop? (or (contains? (get (vocab) :loops) hname) (some? foreign-index))
+                  callback-arity (cond
+                                   (contains? #{"reduce" "reductions" "Enum/reduce" "Elixir.Enum/reduce"
+                                                "lists/foldl" "lists/foldr"} hname) 2
+                                   (contains? #{"map" "mapv" "mapcat"} hname) (- (count (rest items)) 1)
+                                   :else 1)
+                  ; Which arguments run per element. `for`/`doseq`: the BODY
+                  ; (everything after the binding vector). The `map` family:
+                  ; the FUNCTION (first arg) — the collection argument is
+                  ; evaluated ONCE, so a read there is not an N+1.
+                  per-element? (fn [k]
+                                 (cond
+                                   (not loop?) false
+                                   (some? foreign-index) (= k foreign-index)
+                                   (contains? #{"for" "doseq"} hname) (>= k 1)
+                                   :else (= k 0)))
+                  rec-children (fn [a i]
+                                 (reduce (fn [[a2 i2] [k sub]]
+                                           (let [inner-depth (if (per-element? k) (+ depth 1) depth)
+                                                 f (node-form sub)]
+                                             (if (and (per-element? k)
+                                                      (not (contains? #{"for" "doseq"} hname))
+                                                      (= :symbol (node-tag f)))
+                                               (let [p (node-pos sub)]
+                                                 [(conj a2 {:db/id i2 :call/caller caller
+                                                            :call/callee (node-name f)
+                                                            :call/arity callback-arity
+                                                            :call/line (if p (:line p) 0)
+                                                            :call/loop-depth inner-depth})
+                                                  (inc i2)])
+                                               (walk-calls-at caller ns-str sub a2 i2 hint inner-depth))))
+                                         [a i] (map-indexed (fn [k x] [k x]) (rest items))))]
+              (cond
+                ; a loop head is walked as WRITTEN, never through its
+                ; macro expansion: the expansion of `for` is where the
+                ; per-element shape lives, and the depth must be assigned
+                ; on the surface form the author reads.
+                (or (contains? special-heads hname) loop?)
+                  (if loop?
+                    (let [p (node-pos node)
+                          line (if (nil? p) (if (nil? hint) 0 (:line hint)) (:line p))
+                          fact {:db/id next-id
+                                :call/caller caller
+                                :call/callee hname
+                                :call/arity (count (rest items))
+                                :call/line line
+                                :call/loop-depth depth}]
+                      (rec-children (conj acc fact) (+ next-id 1)))
+                    (rec-children acc next-id))
+
+                ; unknown head: macro? expand once, walk the expansion —
+                ; the call graph sees through threading. Not a macro:
+                ; it is a call.
+                :else
+                  (let [orig   (typed/->tuple [:list items])
+                        grew?  (compiler/macroexpand-1 orig ns-str)]
+                    (if (not (identical? grew? orig))
+                      (walk-calls-at caller ns-str grew? acc next-id hint depth)
+                      (let [p (node-pos node)
+                            line (if (nil? p) (if (nil? hint) 0 (:line hint)) (:line p))
+                            fact {:db/id next-id
+                                  :call/caller caller
+                                  :call/callee hname
+                                  :call/arity (count (rest items))
+                                  :call/line line
+                                  :call/loop-depth depth}]
+                        (rec-children (conj acc fact) (+ next-id 1)))))))))
+      :else [acc next-id]))))
+
+(defn defn-form
+  "The NAME a top-level form defines, or nil when it defines nothing.
+
+   The ONE head test: `index-forms` and `system.arity` both ask it, so a form
+   that is a `defn` to one is a `defn` to the other. A name-less `defn` (which
+   no compiler would accept) answers nil here rather than being handed on as a
+   definition with no name."
+  [form]
+  (let [f (node-form form)]
+    (if (and (= :list (node-tag f))
+             (not (empty? (node-items f)))
+             (= :symbol (node-tag (node-form (first (node-items f)))))
+             (contains? #{"defn" "defn-"}
+                        (node-name (node-form (first (node-items f))))))
+      (let [n (second (node-items f))]
+        (if (nil? n) nil (node-name (node-form n))))
+      nil)))
+
