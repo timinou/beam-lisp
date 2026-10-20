@@ -61,6 +61,11 @@ for leaf <- ["build-log.bl", "build.bl"] do
 end
 run = BeamLisp.Env.fetch_exact!("sdk-build-driver", "run")
 files = Path.wildcard(Path.join(work, "sources/*.bl"))
+if phase == "first" do
+  # The loader uses strict Erlang booleans. Missing compiler evidence must be
+  # false rather than nil, especially for units containing arbitrary effects.
+  false = BeamLisp.AOT.replayable_cached_source?("sdkbuild-effects", Path.join(work, "sources/sdkbuild-effects.bl"))
+end
 patterns = %{compilations: {BeamLisp.AOT, :compile_file, 2},
              source_initializations: {BeamLisp.AOT, :load_unit, 2},
              artifact_restorations: {BeamLisp.AOTCache, :restore_prepared, 2},
