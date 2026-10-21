@@ -51,10 +51,15 @@ class TestRuntimePackage(unittest.TestCase):
                 path.chmod(0o755)
             (root / "unrelated").write_text("not a runtime input")
             bundle = root / "runtime.tar.gz"
-            PACKAGE.package_runtime(root, bundle)
+            candidate = root / "candidate"
+            candidate.write_bytes(b"qualified immutable drop")
+            candidate.chmod(0o755)
+            PACKAGE.package_runtime(root, bundle, candidate)
             with tarfile.open(bundle) as archive:
                 self.assertNotIn("unrelated", archive.getnames())
                 self.assertFalse(any(name.endswith(".o") for name in archive.getnames()))
                 for name in inputs:
                     self.assertEqual(name.encode(), archive.extractfile(name).read())
                     self.assertTrue(archive.getmember(name).mode & 0o111)
+                self.assertEqual(b"qualified immutable drop", archive.extractfile(".bl/ci-candidate").read())
+                self.assertTrue(archive.getmember(".bl/ci-candidate").mode & 0o111)

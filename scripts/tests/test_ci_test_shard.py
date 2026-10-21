@@ -18,8 +18,19 @@ class TestPartitions(unittest.TestCase):
                     and not any(part.startswith(".") for part in path.relative_to(root / "test").parts[:-1])}
         self.assertEqual(expected, set(flat))
         self.assertEqual(len(flat), len(set(flat)))
-        self.assertLessEqual(max(map(len, groups)) - min(map(len, groups)), 1)
         self.assertTrue(all(groups))
+
+    def test_long_suites_are_spread_by_duration_without_losing_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "test").mkdir()
+            (root / "scripts").mkdir()
+            for name in "abcd":
+                (root / "test" / f"{name}_test.bl").touch()
+            (root / "scripts/test-durations.json").write_text(
+                '{"test/a_test.bl":9000,"test/b_test.bl":8000,"test/c_test.bl":1000,"test/d_test.bl":1000}')
+            groups = SHARD.partitions(root, 2)
+            self.assertEqual([["test/a_test.bl", "test/d_test.bl"], ["test/b_test.bl", "test/c_test.bl"]], groups)
 
     def test_fixtures_and_hidden_directories_are_not_suites(self):
         with tempfile.TemporaryDirectory() as directory:

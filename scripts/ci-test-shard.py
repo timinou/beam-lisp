@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Run one disjoint partition of the complete conventional test corpus."""
 import argparse
+import json
 import os
 from pathlib import Path
 import subprocess
 import signal
+import sys
 import tempfile
 import time
 
@@ -18,7 +20,16 @@ def partitions(root, count):
         for name in names:
             if name.endswith(("_test.bl", "_test.exs")):
                 files.append(str((Path(directory) / name).relative_to(root)))
-    return [sorted(files)[index::count] for index in range(count)]
+    timing_file = root / "scripts/test-durations.json"
+    if not timing_file.exists():
+        return [sorted(files)[index::count] for index in range(count)]
+    timings = json.loads(timing_file.read_text())
+    groups, loads = [[] for _ in range(count)], [0] * count
+    for name in sorted(files, key=lambda name: (-timings.get(name, 1000), name)):
+        index = min(range(count), key=lambda index: (loads[index], index))
+        groups[index].append(name)
+        loads[index] += max(1, timings.get(name, 1000))
+    return groups
 
 
 def main():
@@ -44,11 +55,14 @@ def main():
                "--property=MemorySwapMax=0", "--property=RuntimeMaxSec=2700",
                f"--setenv=PATH={os.environ.get('PATH', '')}",
                "--setenv=BL_TEST_TIMES=1",
-               str(root / "bin/bl"), "--cold", "test", *selected]
+               sys.executable, str(root / "scripts/qualify-candidate.py"),
+               "--candidate", str(root / ".bl/ci-candidate"),
+               "--results", str(Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir())) /
+                                f"bl-test-results-{args.index}.jsonl"), *selected]
     # The user manager does not inherit the Actions step environment. Carry
     # the producer's selected Rust identity across the same boundary as PATH.
     if os.environ.get("RUSTUP_TOOLCHAIN"):
-        command.insert(command.index(str(root / "bin/bl")),
+        command.insert(command.index(sys.executable),
                        f"--setenv=RUSTUP_TOOLCHAIN={os.environ['RUSTUP_TOOLCHAIN']}")
     runtime_parent = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     with tempfile.TemporaryDirectory(prefix="bl-ci-runtime-", dir=runtime_parent) as runtime:
@@ -56,7 +70,7 @@ def main():
         # manager's actual bus address for capped subprocess verifiers.
         bus = os.environ.get("DBUS_SESSION_BUS_ADDRESS",
                              f"unix:path={runtime_parent}/bus")
-        command[command.index(str(root / "bin/bl")):command.index(str(root / "bin/bl"))] = [
+        command[command.index(sys.executable):command.index(sys.executable)] = [
             f"--setenv=XDG_RUNTIME_DIR={runtime}",
             f"--setenv=DBUS_SESSION_BUS_ADDRESS={bus}"]
         try:
