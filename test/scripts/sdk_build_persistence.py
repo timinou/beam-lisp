@@ -112,7 +112,10 @@ r = if phase == "contended" do
   :erlang.trace(:new, true, [:call, {:tracer, self()}])
   task = Task.async(BeamLisp.Env.convey(invoke))
   try do
-    Enum.reduce_while(1..200, nil, fn _, _ ->
+    # Slow hosts can spend seconds authenticating immutable inputs before
+    # preparation. The traced lock retry below proves contention independently
+    # of this bounded wait; a two-second wall-clock race is not that proof.
+    Enum.reduce_while(1..3000, nil, fn _, _ ->
       case :erlang.trace_info(patterns.artifact_preparations, :call_count) do
         {:call_count, n} when n >= 2 -> {:halt, :prepared}
         _ -> Process.sleep(10); {:cont, nil}
