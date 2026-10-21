@@ -43,6 +43,7 @@ def main():
                f"--working-directory={root}", "--property=MemoryMax=6G",
                "--property=MemorySwapMax=0", "--property=RuntimeMaxSec=2700",
                f"--setenv=PATH={os.environ.get('PATH', '')}",
+               "--setenv=BL_TEST_TIMES=1",
                str(root / "bin/bl"), "--cold", "test", *selected]
     runtime_parent = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     with tempfile.TemporaryDirectory(prefix="bl-ci-runtime-", dir=runtime_parent) as runtime:
