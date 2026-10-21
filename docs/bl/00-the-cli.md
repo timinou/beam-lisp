@@ -945,6 +945,15 @@ Every variable `bl` reads, once. A preference belongs in `env.bl`, `~/.config/bl
 | variable | kind | meaning |
 |---|---|---|
 | `BEAM_LISP_PATH` | override | colon-separated extra library roots, searched after the cwd and before the shipped tiers (`env.bl :paths` is the declared form) |
+| `BEAM_LISP_AOT_BACKEND` | protocol | backend label supplied by native bootstrap; code generation uses `:core` |
+| `BEAM_LISP_EBIN` | protocol | prebuilt compiler-image directory for bootstrap tools |
+| `BL_BOOTSTRAP_SEED` | protocol | explicit compiler-floor directory for bootstrap and recovery |
+| `BL_ANDROID_JAVA_HOME` | override | JDK home for Android builds (default `/usr/lib/jvm/java-21-openjdk`) |
+| `BL_ENV` | override | loading environment; `production` and `prod` select startup loading by default |
+| `BL_JS_CACHE` | override | `on`: enable the experimental checked JavaScript ANF cache |
+| `BL_DEMO_EXPORT` | override | `1`: export rendered scenario demo captures |
+| `BL_STARTUP_PROFILE` | override | `1`: report detailed project-loading measurements |
+| `BL_CHECKOUT_COLD` / `BL_CHECKOUT_ROOT` / `BL_CHECKOUT_GENERATION` / `BL_CHECKOUT_SOURCE_GENERATION` | protocol | checkout transport root, runtime generation and project-source generation supplied by the launcher |
 | `BEAM_LISP_CODE_PATH` | override | colon-separated directories of prebuilt AOT beams to add to the VM code path |
 | `BEAM_LISP_AOT_CACHE` / `BEAM_LISP_AOT_CACHE_DIR` | override | turn the AOT cache off; move it |
 | `BEAM_LISP_AOT_REPAIR` / `BEAM_LISP_AOT_STRICT` | override | whether a stale library beam is repaired in place; whether staleness is an error |
