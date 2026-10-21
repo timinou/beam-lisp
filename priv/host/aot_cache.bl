@@ -562,15 +562,34 @@
     (Enum/reduce (Map/get deps path '()) (MapSet/put seen path)
       (fn [dep acc] (closure_walk dep deps acc)))))
 
+(defn- generation_lock_path [root key]
+  (Path/join (Path/join root ".leases") key))
+
+(defn- with_file_lock [path shared action remaining]
+  (BeamLisp.LazyMemo/ensure_loaded!)
+  (let [r (BeamLisp.LazyMemo/nif_file_lock path shared true)]
+    (if (erlang/== :ok (erlang/element 1 r))
+      (try (action) (finally (BeamLisp.LazyMemo/nif_file_unlock (erlang/element 2 r))))
+      (if (erlang/> remaining 0)
+        (do (Process/sleep 10) (with_file_lock path shared action (erlang/- remaining 1)))
+        (erlang/error :cache_generation_busy)))))
+
+(defn with_generation
+  "Keep cache entries and the SDK producer alive throughout an operation.
+   Independent VMs share custody; GC needs exclusive custody of the same anchor.
+   A process/VM crash releases custody without stale-PID or heartbeat guesses."
+  [key action]
+  (with_file_lock (generation_lock_path (dir) key) true action 500))
+
 ; ── the cache entry: fetch, store, validate ────────────────────────────────
 
-(defn fetch
+(defn- fetch_unlocked
   "Link a cached entry's beams into `compile_path`. Returns `{:ok, modules}`
    when the entry existed and every beam materialised, `:miss` otherwise (absent
    entry, or any link/copy failure — the caller compiles instead). The four-arg
    form separates a context-specific cache address from actual source provenance."
   ([compiler_key closure_key compile_path]
-   (fetch compiler_key closure_key compile_path closure_key))
+   (fetch_unlocked compiler_key closure_key compile_path closure_key))
   ([compiler_key cache_key compile_path source_key]
   (let [entry (entry_dir compiler_key cache_key)
         modules (valid_keyed_entry entry compiler_key source_key)]
@@ -581,7 +600,13 @@
         (erlang/== :ok (link_beams entry compile_path modules)) (tup :ok modules)
         :else :miss)))))
 
-(defn prepare_fetch
+(defn fetch
+  ([key closure out] (fetch key closure out closure))
+  ([key cache out source]
+   (try (with_generation key (fn [] (fetch_unlocked key cache out source)))
+        (catch _ :miss))))
+
+(defn- prepare_fetch_unlocked
   "Capture a complete verified cache unit without loading code, initializing
    namespaces or changing the destination. Reads and validation need no build
    publication lock. A captured unit remains usable if cache GC removes it."
@@ -600,6 +625,10 @@
                                             compiler_key closure_key))))
             (Map/new (lst (tup :modules modules) (tup :beams beams)))))))
     (catch _ nil)))
+
+(defn prepare_fetch [key closure]
+  (try (with_generation key (fn [] (prepare_fetch_unlocked key closure)))
+       (catch _ nil)))
 
 (defn prepared_replay_complete?
   "Compiler-produced coverage of every top-level form, carried by the actual
@@ -634,14 +663,14 @@
           (finally (File/rm tmp))))))
   (Map/get prepared :modules))
 
-(defn store
+(defn- store_unlocked
   "Publish the beams for `modules` (already in `compile_path`) under the given
    keys. Atomic via temp-dir + rename; failures are ignored. The manifest is
    `%{version: 2, modules: modules, digests: digests}` — the SAME layout the
    recalled module wrote, so entries are interchangeable in both directions.
    The five-arg form validates source_key while publishing under cache_key."
   ([compiler_key closure_key compile_path modules]
-   (store compiler_key closure_key compile_path modules closure_key))
+   (store_unlocked compiler_key closure_key compile_path modules closure_key))
   ([compiler_key cache_key compile_path modules source_key]
   (let [final (writable_entry_dir compiler_key cache_key)
         tmp (temp_path final)]
@@ -665,15 +694,23 @@
         (cond
           (erlang/== nil (valid_keyed_entry tmp compiler_key source_key)) (File/rm_rf! tmp)
           :else
-          (global/trans (tup (tup (toolchain_key_pt) :publish final) (erlang/self))
+          (with_file_lock (Path/join (Path/join (Path/join (dir) ".entries") compiler_key) cache_key) false
           (fn []
             (cond
               (erlang/not (erlang/== nil (valid_keyed_entry final compiler_key source_key))) (File/rm_rf! tmp)
               :else (do (File/rm_rf! final) (File/rename! tmp final))))
-          (lst (erlang/node))))
-        (maybe_cleanup_obsolete_generations compiler_key)
+          500))
         :ok)
       (catch _e (do (File/rm_rf tmp) :ok))))))
+
+(defn store
+  ([key closure out modules] (store key closure out modules closure))
+  ([key cache out modules source]
+   (try
+     (with_generation key (fn [] (store_unlocked key cache out modules source)))
+     (maybe_cleanup_obsolete_generations key)
+     :ok
+     (catch _ :ok))))
 
 (defn- valid_entry
   "The module list of a COMPLETE entry, or nil. A manifest is trusted only when
@@ -809,13 +846,21 @@
            (tup :ok '())
            :else (tup :error (erlang/element 2 listed)))
          :else
-         (let [entries (erlang/element 2 listed)
+         (let [sdk-root (Path/join root "sdk-build")
+               sdk-listed (File/ls sdk-root)
+               entries (Enum/uniq (erlang/++ (erlang/element 2 listed)
+                          (if (erlang/== :ok (erlang/element 1 sdk-listed))
+                            (erlang/element 2 sdk-listed) (list))))
                generations (Enum/sort_by
                              (Enum/flat_map
                                (Enum/reject
                                  (Enum/filter entries (fn [n] (valid_compiler_key? n)))
                                  (fn [n] (erlang/== n active_key)))
-                               (fn [n] (generation_info root n)))
+                               (fn [n]
+                                 (let [parts (erlang/++ (generation_info root n) (generation_info sdk-root n))]
+                                   (if (erlang/== (list) parts) (list)
+                                     (lst {:name n :paths (Enum/map parts (fn [g] (Map/get g :path)))
+                                           :mtime (Enum/max (Enum/map parts (fn [g] (Map/get g :mtime))))})))))
                              (fn [g] (Map/get g :mtime))
                              :desc)
                now (System/os_time :second)
@@ -834,11 +879,18 @@
                             (Keyword/get options :max_delete))
                deleted (Enum/flat_map candidates
                          (fn [g]
-                           (let [rr (File/rm_rf (Map/get g :path))]
-                             (cond
-                               (and (erlang/is_tuple rr) (erlang/== :ok (erlang/element 1 rr)))
-                               (lst (Map/get g :name))
-                               :else '()))))]
+                           (BeamLisp.LazyMemo/ensure_loaded!)
+                           (let [r (BeamLisp.LazyMemo/nif_file_lock
+                                     (generation_lock_path root (Map/get g :name)) false true)]
+                             (if (erlang/== :ok (erlang/element 1 r))
+                               (try
+                                 (let [results (Enum/map (erlang/++ (Map/get g :paths)
+                                                    (lst (Path/join (Path/join root ".entries") (Map/get g :name))))
+                                                (fn [path] (File/rm_rf path)))]
+                                   (if (Enum/all? results (fn [rr] (erlang/== :ok (erlang/element 1 rr))))
+                                     (lst (Map/get g :name)) (list)))
+                                 (finally (BeamLisp.LazyMemo/nif_file_unlock (erlang/element 2 r))))
+                               (list)))))]
            (tup :ok deleted))))
      (catch _e (tup :ok '())))))
 

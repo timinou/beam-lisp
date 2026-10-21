@@ -2581,14 +2581,16 @@
 ;; (measured: 22% of application start). Keep it beside the AOT cache, addressed
 ;; by the source digest and the compiler key (which covers the reader). It is
 ;; still only syntax: every caller re-checks source and native identity.
+(defn- native_declaration_name [digest ns]
+  (erlang/iolist_to_binary (list (Base/encode16 digest (list (tuple :case :lower))) "-"
+                                (Base/encode16 (crypto/hash :sha256 ns) (list (tuple :case :lower))))))
+
 (defn- native_declaration_path [digest ns]
   (Path/join (Path/join (Path/join (BeamLisp.AOTCache/dir) "native-declarations")
-                        (BeamLisp.AOTCache/compiler_key))
-             (erlang/iolist_to_binary (list (Base/encode16 digest (list (tuple :case :lower))) "-"
-                                            (Base/encode16 (crypto/hash :sha256 ns) (list (tuple :case :lower)))))))
+                        (BeamLisp.AOTCache/compiler_key)) (native_declaration_name digest ns)))
 
-(defn- disk_native_declaration [digest ns]
-  (let [r (File/read (native_declaration_path digest ns))]
+(defn- read_native_declaration [path digest ns]
+  (let [r (File/read path)]
     (when (and (erlang/is_tuple r) (erlang/== :ok (elem r 0)))
       (try
         (let [t (erlang/binary_to_term (elem r 1) (list :safe))]
@@ -2596,6 +2598,31 @@
                      (erlang/== digest (elem t 0)) (erlang/== ns (elem t 1)))
             (elem t 2)))
         (catch _ nil)))))
+
+(defn- disk_native_declaration [digest ns]
+  (or (read_native_declaration
+        (Path/join (Path/join (Path/join (BeamLisp.Tiers/priv_root) "native-declarations")
+                              (BeamLisp.AOTCache/compiler_key)) (native_declaration_name digest ns)) digest ns)
+      (read_native_declaration (native_declaration_path digest ns) digest ns)))
+
+(defn prime_native_declarations!
+  "Ship content-keyed native syntax with the SDK, as with its source parts.
+   Fresh machines need no reader pass to rediscover already-built declarations.
+   Every use still verifies source bytes and physical native code identity."
+  [root]
+  (let [output (Path/join (Path/join root "native-declarations") (BeamLisp.AOTCache/compiler_key))]
+    (File/mkdir_p! output)
+    (Enum/reduce (BeamLisp.Tiers/sources root) 0
+      (fn [path count]
+        (let [content (BeamLisp.Loader/read_source path)]
+          (if (String/contains? content "defnative")
+            (let [ns (BeamLisp.Loader/declared_ns content)
+                  declaration (when ns (sdk_native_source_declaration_content ns path content))]
+              (if declaration
+                (let [digest (crypto/hash :sha256 content)]
+                  (File/write! (Path/join output (native_declaration_name digest ns))
+                    (erlang/term_to_binary (tuple digest ns declaration) (list :deterministic)))
+                  (erlang/+ count 1)) count)) count))))))
 
 (defn- store_native_declaration! [digest ns declaration]
   (try
@@ -4445,11 +4472,16 @@
    dedups its own closure — and no correctness property depends on a caller
    taking a pass."
   [fun]
+  (BeamLisp.Loader/with_declaration_snapshot (fn [] (source_snapshot_pass fun))))
+
+(defn- source_snapshot_pass [fun]
   (if (erlang/== nil (Process/get :bl_source_snapshot))
     (do
       (Process/put :bl_source_snapshot {})
       (let [previous (Process/get :bl_source_info_cache)
-            previous-parts (Process/get :bl_source_parts_cache)]
+            previous-parts (Process/get :bl_source_parts_cache)
+            previous-nodes (Process/get :bl_source_graph_nodes)]
+        (Process/put :bl_source_graph_nodes {})
         (Process/put :bl_source_parts_cache {})
         (try (fun)
           (finally
@@ -4457,7 +4489,9 @@
             (if (erlang/== nil previous) (Process/delete :bl_source_info_cache)
               (Process/put :bl_source_info_cache previous))
             (if (erlang/== nil previous-parts) (Process/delete :bl_source_parts_cache)
-              (Process/put :bl_source_parts_cache previous-parts))))))
+              (Process/put :bl_source_parts_cache previous-parts))
+            (if (nil? previous-nodes) (Process/delete :bl_source_graph_nodes)
+              (Process/put :bl_source_graph_nodes previous-nodes))))))
     (fun)))
 
 (defn ns_closure_hash
@@ -4469,14 +4503,18 @@
   ([ns file] :when (string? ns)
    (let [shared (Process/get :bl_source_snapshot)]
      (if (erlang/== nil shared)
-       (let [previous-parts (Process/get :bl_source_parts_cache)]
+       (let [previous-parts (Process/get :bl_source_parts_cache)
+             previous-nodes (Process/get :bl_source_graph_nodes)]
+         (Process/put :bl_source_graph_nodes {})
          (Process/put :bl_source_info_cache {})
          (Process/put :bl_source_parts_cache {})
          (try (closure_hash_of ns file)
               (finally
                (Process/delete :bl_source_info_cache)
                (if (nil? previous-parts) (Process/delete :bl_source_parts_cache)
-                (Process/put :bl_source_parts_cache previous-parts)))))
+                (Process/put :bl_source_parts_cache previous-parts))
+               (if (nil? previous-nodes) (Process/delete :bl_source_graph_nodes)
+                 (Process/put :bl_source_graph_nodes previous-nodes)))))
        (do
          ; A pass is open: ITS cache is this call's cache. Write the merged
          ; map back to the pass afterwards so the next member is shared.
@@ -4484,19 +4522,28 @@
          (try (closure_hash_of ns file)
               (finally (Process/put :bl_source_snapshot (Process/get :bl_source_info_cache {})))))))))
 
-(defn- closure_hash_of
-  "`ns_closure_hash`'s body, folded against whatever `:bl_source_info_cache`
-   currently holds."
-  [ns file]
-  (let [seed (if (and file (File/exists? file))
-               (list ns (BeamLisp.Loader/read_source file))
-               nil)]
-    ; Packaged runtimes carry beams without source. Answer before loading the
-    ; planner: its own closure vetting would recurse into this gate.
-    (if (and (nil? seed) (nil? (source_content_cached ns)))
-      nil
-      (BeamLisp.BuildPlan/key_for ns (fn [n] (source_content_cached n)) seed
-        (fn [n content] (source_node_cached n content))))))
+(defn- source_resolution_key [ns]
+  (let [dirs (BeamLisp.Loader/search_dirs)]
+    (tuple (BeamLisp.Env/env_id) dirs (BeamLisp.Loader/realm_context) ns
+           (BeamLisp.Loader/package_provider ns)
+           (when (Enum/any? dirs (fn [d] (not= :absolute (Path/type d)))) (File/cwd!)))))
+
+(defn- source_graph_node_cached [ns]
+  (let [key (source_resolution_key ns)
+        cache (Process/get :bl_source_graph_nodes {})]
+    (if (Map/has_key? cache key) (Map/get cache key)
+      (let [content (source_content_cached ns)
+            node (when content (source_node_cached ns content))]
+        (when (< (erlang/map_size cache) 8192)
+          (Process/put :bl_source_graph_nodes (Map/put cache key node)))
+        node))))
+
+(defn- closure_hash_of [ns file]
+  (let [seed (when (and file (File/exists? file))
+               (source_node_cached ns (BeamLisp.Loader/read_source file)))
+        nodes (BeamLisp.BuildPlan/nodes_from_resolver ns
+                (fn [name] (if (and seed (= name ns)) seed (source_graph_node_cached name))))]
+    (when nodes (BeamLisp.BuildPlan/key_from_nodes ns nodes))))
 
 (defn- primed_source_parts
  "The content parts `bl self-build` primed into this image for the source
@@ -4554,8 +4601,7 @@
    name cannot reuse an absent/live result after provider installation, or use
    another environment's immutable source fallback."
   [ns]
-  (let [key (tuple (BeamLisp.Env/env_id) (Process/get :bl_search_dirs nil) ns
-                   (BeamLisp.Loader/package_provider ns))
+  (let [key (source_resolution_key ns)
         cache (Process/get :bl_source_info_cache {})]
     (if (erlang/is_map_key key cache)
       (Map/get cache key)
@@ -5424,8 +5470,10 @@
  (let [file (Keyword/get opts :file nil)
        forms (BeamLisp.Reader/read_string source file)
        header (stage-preflight! forms) ns (:ns header)
-       previous (BeamLisp.Env/current_ns)]
+       previous (BeamLisp.Env/current_ns)
+       prior-declarations (Process/get :bl_sdk_stage_declarations)]
   (try
+   (Process/put :bl_sdk_stage_declarations {})
    (BeamLisp.Env/declare_ns ns) (BeamLisp.Env/in_ns ns)
    (doseq [pair (Map/get (:metadata header) :aliases)]
     (BeamLisp.Env/add_alias ns (elem pair 0) (elem pair 1)))
@@ -5443,8 +5491,12 @@
            (let [metadata (capture_ns_decl {} (first forms))
                  declaration (first (filter #(= "defnative" (stage-head %)) (rest forms)))]
             (if declaration (assoc-in metadata [ns :native-declaration] (stage-native declaration)) metadata)) file
-           (when (constructor_context) (Map/get (constructor_context!) :declarations {}))))
-   (finally (BeamLisp.Env/in_ns previous)))))
+           (if (constructor_context) (Map/get (constructor_context!) :declarations {})
+             (Process/get :bl_sdk_stage_declarations {}))))
+   (finally
+    (if prior-declarations (Process/put :bl_sdk_stage_declarations prior-declarations)
+      (Process/delete :bl_sdk_stage_declarations))
+    (BeamLisp.Env/in_ns previous)))))
 
 ;; HOME integration draft. The object path selects current source discovery;
 ;; only new compiler output can subsequently supply executable authority.
@@ -7771,18 +7823,20 @@
     (and (erlang/is_map metadata) (= true (maps/get :private metadata false)))))
 
 (defn- sdk_record_declaration! [form namespace bindings kind]
-  (when (constructor_context)
-    (let [private? (sdk_checked_private? form)
-          declarations (Map/get (constructor_context!) :declarations {})
-          names (Map/get declarations namespace {})
-          kinds (Map/get declarations :callable-kinds {})
-          prior-kinds (Map/get kinds namespace {})]
-      (constructor_context_put! :declarations
-        (Map/put (Map/put declarations namespace
-          (Enum/reduce bindings names
-            (fn [binding out] (Map/put out binding (if private? :private kind)))))
-         :callable-kinds (Map/put kinds namespace (Enum/reduce bindings prior-kinds
-           (fn [binding out] (Map/put out binding (sdk_callable_kind (stage-head form)))))))))))
+  (let [context (constructor_context)
+        declarations (if context (Map/get context :declarations {})
+                         (Process/get :bl_sdk_stage_declarations {}))
+        private? (sdk_checked_private? form)
+        names (Map/get declarations namespace {})
+        kinds (Map/get declarations :callable-kinds {})
+        prior-kinds (Map/get kinds namespace {})
+        updated (Map/put (Map/put declarations namespace
+                  (Enum/reduce bindings names
+                    (fn [binding out] (Map/put out binding (if private? :private kind)))))
+                  :callable-kinds (Map/put kinds namespace (Enum/reduce bindings prior-kinds
+                    (fn [binding out] (Map/put out binding (sdk_callable_kind (stage-head form)))))))]
+    (if context (constructor_context_put! :declarations updated)
+      (Process/put :bl_sdk_stage_declarations updated))))
 
 (defn- constructor_record_definition! [form namespace]
  (when-let [context (constructor_context)]
