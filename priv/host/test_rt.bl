@@ -390,7 +390,7 @@
          (fn []
            (BeamLisp/init)
            (let [base (BeamLisp.Env/fork :global)]
-             (BeamLisp.Env/with_env base
+             (try (BeamLisp.Env/with_env base
                (fn []
                  (BeamLisp.Compiler/eval_string (test_lib_source)
                                                 (BeamLisp.Compiler/new_env "core"))
@@ -399,12 +399,14 @@
                      (BeamLisp.Env/in_ns "user")
                      (eval-file path)))
                  (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "core" "run-tests")
-                                        (list :all))))))
+                                        (list :all))))
+              (finally (BeamLisp.Env/destroy base)))))
          run-async
          (fn []
            (BeamLisp/init)
            (let [base (BeamLisp.Env/fork :global)]
-             (BeamLisp.Env/with_env base
+             (try
+              (BeamLisp.Env/with_env base
                (fn []
                  (BeamLisp.Compiler/eval_string (test_lib_source)
                                                 (BeamLisp.Compiler/new_env "core"))))
@@ -413,17 +415,21 @@
              (let [results (Enum/map
                              (Task/async_stream
                                paths
-                               (fn [path] (tuple path (run-file-isolated base path)))
+                               (fn [path]
+                                 ;; Return loading failures to the owning frame.
+                                 ;; A linked task exit would skip its cleanup.
+                                 (try (tuple path (run-file-isolated base path))
+                                      (catch error (tuple :suite-worker-error error))))
                                (list (tuple :max_concurrency (System/schedulers_online))
                                      (tuple :ordered true)
                                      (tuple :timeout :infinity)))
-                             ; A task that RAISES answers `{:exit, reason}`, and
-                             ; the live `Enum.map(fn {:ok, r} -> r end)` refuses
-                             ; it with a FunctionClauseError. Reproduce the
-                             ; refusal by hand rather than reading a failed run as
-                             ; a totals map.
+                             ; Loading failures retain the existing FunctionClauseError
+                             ; refusal, raised by the owning frame so its finally
+                             ; cleanup runs before returning to a warm caller.
                              (fn [t]
-                               (if (erlang/== :ok (erlang/element 1 t))
+                               (if (and (erlang/== :ok (erlang/element 1 t))
+                                        (erlang/is_tuple (erlang/element 2 t))
+                                        (erlang/is_binary (erlang/element 1 (erlang/element 2 t))))
                                  (erlang/element 2 t)
                                  (erlang/error
                                    (FunctionClauseError/exception
@@ -438,7 +444,8 @@
                                         (fn [pair]
                                           (erlang/element 1 (erlang/element 2 pair)))))]
                  (print_summary totals)
-                 totals))))]
+                 totals))
+              (finally (BeamLisp.Env/destroy base)))))]
      (if (Keyword/get opts :async false) (run-async) (run-serial)))))
 
 (defn cli
@@ -462,142 +469,6 @@
    that must work where `:code.priv_dir/1` does not (escripts)."
   []
   ;; @@EMBED-TEST-LIB@@
-"; priv/test.bl — clojure.test, ported. beam-lisp carries its own test
-; suite: deftest/is/testing/are register tests whose storage lives in
-; BeamLisp.TestRT (ETS), so they survive across files and runs.
-;
-; Loaded into the `core` namespace (before any test file) so its macros
-; resolve from every namespace via the usual core fallback — the same
-; trick that puts cond/case/when in core.bl. `run-tests` drives the
-; run and prints the clojure.test-shaped summary.
-
-; --- assertion runtime ---
-; A failing `is` must not halt the run: it records and returns. The
-; form is passed both as its datum (for failure detail) and as a thunk
-; (for evaluation), so exceptions inside it are caught here, not raised.
-
-(defn test-record [ns type form msg expected actual]
-  (BeamLisp.TestRT/record ns type form msg expected actual))
-
-(defn is-report [ns form msg f]
-  (try
-    (let [v (f)]
-      (if v
-        (do (test-record ns :pass form msg nil v) true)
-        (do (test-record ns :fail form msg form v) false)))
-    (catch e
-      (test-record ns :error form msg form e)
-      false)))
-
-; The `=` case reports expected/actual separately, as clojure.test does — as
-; VALUES. `expected` is what the LEFT operand EVALUATED to, the one place that
-; value exists: a report carrying the FORMS instead makes every renderer print a
-; symbol where a value belongs (`expected: serial` for a var holding rows). The
-; whole form is carried in `form`, so the operand that produced the value is
-; still there to be seen.
-(defn is-eq-report [ns form msg fa fb]
-  (try
-    (let [av (fa) bv (fb)]
-      (if (= av bv)
-        (do (test-record ns :pass form msg nil bv) true)
-        (do (test-record ns :fail form msg av bv) false)))
-    (catch e
-      (test-record ns :error form msg form e)
-      false)))
-
-; --- the macros ---
-; Each captures the current namespace at expansion time (the test file's
-; `(ns …)` is already in effect), so records land in the right namespace
-; even after later files have switched it.
-
-(defmacro deftest [name & body]
-  `(do
-     (BeamLisp.TestRT/register_test ~(BeamLisp.Env/current_ns)
-                                    ~(BeamLisp.TestRT/sym_name name)
-                                    (fn [] ~@body))
-     nil))
-
-(defmacro is
-  ([form] `(is ~form nil))
-  ([form msg]
-    (if (BeamLisp.TestRT/eq_form? form)
-      (let [[_ a b] form]
-        `(is-eq-report ~(BeamLisp.Env/current_ns)
-                       (quote ~form) ~msg
-                       (fn [] ~a) (fn [] ~b)))
-      `(is-report ~(BeamLisp.Env/current_ns) (quote ~form) ~msg (fn [] ~form)))))
-
-(defmacro thrown?
-  \"True when evaluating `body` raises — ANY raise, of any kind.
-
-   clojure.test spells this `(is (thrown? ExceptionType expr))`. beam-lisp
-   DOES discriminate on exception types: `(catch Module.Name e …)` matches
-   one Elixir exception struct, so a type-narrowing assertion is writable
-   as `(is (try expr false (catch ArgumentError e true) (catch e false)))`.
-
-   This macro stays untyped on purpose. Most of its uses assert that a
-   function REFUSES, where the contract is 'this must not succeed' rather
-   than 'this must fail with precisely that struct' — and pinning the type
-   there couples every test to which internal error a validation happens to
-   raise today. Reach for the typed `catch` when the type IS the contract.
-
-   Needed because the alternative — asserting on a function's return value —
-   cannot express the contract of a fn whose job is to REFUSE. `parse` failing
-   loud on an unknown clause is a feature (a silently-dropped clause is a seam
-   hole no later check can see), and a feature with no way to assert it is a
-   feature that rots.\"
-  [& body]
-  `(try
-     (do ~@body false)
-     (catch e# true)))
-
-(defmacro thrown-with-msg?
-  \"Like `thrown?`, but also requires the error message to contain `needle`.
-   Use when several failure modes share a call site and the test would
-   otherwise pass on the WRONG error.\"
-  [needle & body]
-  `(try
-     (do ~@body false)
-     (catch e# (includes? (str (ex-message e#)) ~needle))))
-
-(defmacro testing [str & body]
-  `(BeamLisp.TestRT/with_context ~str (fn [] ~@body)))
-
-; are: table-driven is. Each full row binds argv onto the template and
-; becomes one (is template). A trailing partial row is ignored.
-(defmacro are [argv expr & rows]
-  (if (empty? rows)
-    `(do)
-    (let [n (count argv)]
-      (if (= n 0)
-        (let [forms (map (fn [_] (list (quote is) expr)) rows)]
-          (cons (quote do) forms))
-        (loop [i 0 acc ()]
-          (if (< (- (count rows) i) n)
-            (cons (quote do) (lists/reverse acc))
-            (recur (+ i n)
-                   (cons (list (quote is)
-                               (BeamLisp.TestRT/subst argv (take n (drop i rows)) expr))
-                         acc))))))))
-
-; --- running ---
-; run-tests is a runtime fn (nothing to expand); it runs each namespace's
-; tests through BeamLisp.TestRT and returns the grand totals map.
-
-(defn run-tests
-  \"Run registered tests for the current ns, one ns, or :all. Prints
-  per-failure detail and a summary; returns a totals map.\"
-  ([] (run-tests (BeamLisp.Env/current_ns)))
-  ([ns-or-all]
-   (if (BeamLisp.TestRT/declaring?)
-     {:tests 0 :pass 0 :fail 0 :error 0}
-     (let [nss (if (= ns-or-all :all)
-               (BeamLisp.TestRT/test_namespaces)
-               [ns-or-all])
-         results (map (fn [ns] (BeamLisp.TestRT/run_ns ns)) nss)
-         totals (BeamLisp.TestRT/aggregate results)]
-     (BeamLisp.TestRT/print_summary totals)
-     totals))))
-"
+"; priv/test.bl — clojure.test, ported. beam-lisp carries its own test\n; suite: deftest/is/testing/are register tests whose storage lives in\n; BeamLisp.TestRT (ETS), so they survive across files and runs.\n;\n; Loaded into the `core` namespace (before any test file) so its macros\n; resolve from every namespace via the usual core fallback — the same\n; trick that puts cond/case/when in core.bl. `run-tests` drives the\n; run and prints the clojure.test-shaped summary.\n\n; --- assertion runtime ---\n; A failing `is` must not halt the run: it records and returns. The\n; form is passed both as its datum (for failure detail) and as a thunk\n; (for evaluation), so exceptions inside it are caught here, not raised.\n\n(defn test-record [ns type form msg expected actual]\n  (BeamLisp.TestRT/record ns type form msg expected actual))\n\n(defn is-report [ns form msg f]\n  (try\n    (let [v (f)]\n      (if v\n        (do (test-record ns :pass form msg nil v) true)\n        (do (test-record ns :fail form msg form v) false)))\n    (catch e\n      (test-record ns :error form msg form e)\n      false)))\n\n; The `=` case reports expected/actual separately, as clojure.test does — as\n; VALUES. `expected` is what the LEFT operand EVALUATED to, the one place that\n; value exists: a report carrying the FORMS instead makes every renderer print a\n; symbol where a value belongs (`expected: serial` for a var holding rows). The\n; whole form is carried in `form`, so the operand that produced the value is\n; still there to be seen.\n(defn is-eq-report [ns form msg fa fb]\n  (try\n    (let [av (fa) bv (fb)]\n      (if (= av bv)\n        (do (test-record ns :pass form msg nil bv) true)\n        (do (test-record ns :fail form msg av bv) false)))\n    (catch e\n      (test-record ns :error form msg form e)\n      false)))\n\n; --- the macros ---\n; Each captures the current namespace at expansion time (the test file's\n; `(ns …)` is already in effect), so records land in the right namespace\n; even after later files have switched it.\n\n(defmacro deftest [name & body]\n  `(do\n     (BeamLisp.TestRT/register_test ~(BeamLisp.Env/current_ns)\n                                    ~(BeamLisp.TestRT/sym_name name)\n                                    (fn [] (do ~@body)))\n     nil))\n\n(defmacro is\n  ([form] `(is ~form nil))\n  ([form msg]\n    (if (BeamLisp.TestRT/eq_form? form)\n      (let [[_ a b] form]\n        `(is-eq-report ~(BeamLisp.Env/current_ns)\n                       (quote ~form) ~msg\n                       (fn [] (do ~a)) (fn [] (do ~b))))\n      `(is-report ~(BeamLisp.Env/current_ns) (quote ~form) ~msg (fn [] (do ~form))))))\n\n(defmacro thrown?\n  \"True when evaluating `body` raises — ANY raise, of any kind.\n\n   clojure.test spells this `(is (thrown? ExceptionType expr))`. beam-lisp\n   DOES discriminate on exception types: `(catch Module.Name e …)` matches\n   one Elixir exception struct, so a type-narrowing assertion is writable\n   as `(is (try expr false (catch ArgumentError e true) (catch e false)))`.\n\n   This macro stays untyped on purpose. Most of its uses assert that a\n   function REFUSES, where the contract is 'this must not succeed' rather\n   than 'this must fail with precisely that struct' — and pinning the type\n   there couples every test to which internal error a validation happens to\n   raise today. Reach for the typed `catch` when the type IS the contract.\n\n   Needed because the alternative — asserting on a function's return value —\n   cannot express the contract of a fn whose job is to REFUSE. `parse` failing\n   loud on an unknown clause is a feature (a silently-dropped clause is a seam\n   hole no later check can see), and a feature with no way to assert it is a\n   feature that rots.\"\n  [& body]\n  `(try\n     (do ~@body false)\n     (catch e# true)))\n\n(defmacro thrown-with-msg?\n  \"Like `thrown?`, but also requires the error message to contain `needle`.\n   Use when several failure modes share a call site and the test would\n   otherwise pass on the WRONG error.\"\n  [needle & body]\n  `(try\n     (do ~@body false)\n     (catch e# (includes? (str (ex-message e#)) ~needle))))\n\n(defmacro testing [str & body]\n  `(BeamLisp.TestRT/with_context ~str (fn [] ~@body)))\n\n; are: table-driven is. Each full row binds argv onto the template and\n; becomes one (is template). A trailing partial row is ignored.\n(defmacro are [argv expr & rows]\n  (if (empty? rows)\n    `(do)\n    (let [n (count argv)]\n      (if (= n 0)\n        (let [forms (map (fn [_] (list (quote is) expr)) rows)]\n          (cons (quote do) forms))\n        (loop [i 0 acc ()]\n          (if (< (- (count rows) i) n)\n            (cons (quote do) (lists/reverse acc))\n            (recur (+ i n)\n                   (cons (list (quote is)\n                               (BeamLisp.TestRT/subst argv (take n (drop i rows)) expr))\n                         acc))))))))\n\n; --- running ---\n; run-tests is a runtime fn (nothing to expand); it runs each namespace's\n; tests through BeamLisp.TestRT and returns the grand totals map.\n\n(defn run-tests\n  \"Run registered tests for the current ns, one ns, or :all. Prints\n  per-failure detail and a summary; returns a totals map.\"\n  ([] (run-tests (BeamLisp.Env/current_ns)))\n  ([ns-or-all]\n   (if (BeamLisp.TestRT/declaring?)\n     {:tests 0 :pass 0 :fail 0 :error 0}\n     (let [nss (if (= ns-or-all :all)\n               (BeamLisp.TestRT/test_namespaces)\n               [ns-or-all])\n         results (map (fn [ns] (BeamLisp.TestRT/run_ns ns)) nss)\n         totals (BeamLisp.TestRT/aggregate results)]\n     (BeamLisp.TestRT/print_summary totals)\n     totals))))\n"
   ;; @@/EMBED-TEST-LIB@@
 )
