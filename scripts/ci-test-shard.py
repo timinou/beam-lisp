@@ -44,11 +44,12 @@ def main():
                "--property=MemorySwapMax=0", "--property=RuntimeMaxSec=2700",
                f"--setenv=PATH={os.environ.get('PATH', '')}",
                str(root / "bin/bl"), "--cold", "test", *selected]
-    with tempfile.TemporaryDirectory(prefix="bl-ci-runtime-") as runtime:
+    runtime_parent = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    with tempfile.TemporaryDirectory(prefix="bl-ci-runtime-", dir=runtime_parent) as runtime:
         # Keep automatic checkout endpoints local to this shard. Preserve the
         # manager's actual bus address for capped subprocess verifiers.
         bus = os.environ.get("DBUS_SESSION_BUS_ADDRESS",
-                             f"unix:path={os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')}/bus")
+                             f"unix:path={runtime_parent}/bus")
         command[command.index(str(root / "bin/bl")):command.index(str(root / "bin/bl"))] = [
             f"--setenv=XDG_RUNTIME_DIR={runtime}",
             f"--setenv=DBUS_SESSION_BUS_ADDRESS={bus}"]
