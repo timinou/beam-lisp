@@ -1,0 +1,149 @@
+; Native preparation of the SDK call paths used by a checked Source graph.
+; Metadata is read, never executed, to find further bindings. Unused SDK
+; functions and quoted provider names do not become initialization requests.
+(ns reload.sdk-readiness (:require [reload.native-call :as native-call]))
+
+(def ^:private closures (atom {}))
+
+(defn reference [node]
+ (cond
+  (= :global (:op node)) [:binding (:ns node) (:name node)]
+  (= :remote (:op node))
+   (cond
+    (and (= :Elixir.BeamLisp.Loader (:mod node)) (= :ensure_ready (:fun node))
+         (= 1 (count (:args node))) (= :lit (:op (first (:args node)))))
+     [:namespace (:val (first (:args node)))]
+    (and (= :Elixir.BeamLisp.Env (:mod node)) (= :invoke_source_native! (:fun node))
+         (= 3 (count (:args node))) (= :lit (:op (first (:args node))))
+         (= :lit (:op (second (:args node)))))
+     [:remote (:val (first (:args node))) (:val (second (:args node)))
+              (count (native-call/checked-arguments (nth (:args node) 2)))]
+    :else [:remote (:mod node) (:fun node) (count (:args node))])
+  :else nil))
+
+(defn prepare!
+ "Initialize only fixed SDK namespaces reached by actual executable binding
+  reads/calls, following their actual function descriptors transitively. This
+  grants no invocation authority and never evaluates a candidate function."
+ [roots]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [frame (tuple :sdk-readiness (erlang/make_ref))
+       inventory (BeamLisp.AOT/sdk_inventory_input)
+       image-key (when (elem inventory 1) (crypto/hash :sha256 (elem inventory 1)))]
+  ;; Invocation-local compiler data must not live in native memo cells: every
+  ;; read/write there copies and scans the growing descriptor graph. This frame
+  ;; retains ordinary immutable terms only during this synchronous preparation.
+  (Process/put frame {:pending (vec roots) :seen #{} :namespaces {} :modules {}
+                      :initialized #{} :fuel 262144})
+  (try
+  (letfn [(read [key] (maps/get key (Process/get frame)))
+          (write! [key value] (Process/put frame (maps/put key value (Process/get frame))) value)
+          (step! []
+            (when (neg? (write! :fuel (dec (read :fuel))))
+             (throw (ex-info "SDK readiness graph exceeds its finite bound"
+                             {:kind :sdk-readiness-budget}))))
+          (enqueue! [target] (when target (write! :pending (conj (read :pending) target))))
+          (walk [node]
+            ;; Compiler descriptors are finite data. Visit them eagerly and
+            ;; keep literal/annotation/pattern payloads opaque.
+            (cond
+             (map? node)
+              (do (step!) (enqueue! (reference node))
+               (when-not (= :lit (:op node))
+                (Enum/each (maps/to_list node)
+                 (fn [pair]
+                  (when-not (contains? #{:ann :meta :params :pats :pat :attrs :exports} (elem pair 0))
+                   (walk (elem pair 1)))))))
+             (erlang/is_list node) (do (step!) (Enum/each node walk))
+             (vector? node) (do (step!) (Enum/each (BeamLisp.Vector/to_list node) walk))
+             (erlang/is_tuple node) (do (step!) (Enum/each (erlang/tuple_to_list node) walk))))
+          (sdk-namespace [namespace]
+            (if (contains? (read :namespaces) namespace) (get (read :namespaces) namespace)
+             (let [source (when (string? namespace) (BeamLisp.Loader/source_path namespace))
+                   fixed? (and source (BeamLisp.AOT/sdk_library_source? namespace source))
+                   info (when fixed?
+                          ;; Initialize the unit before reading its current
+                          ;; descriptor, but never all its function bodies.
+                          (when (and (not (contains? (read :initialized) namespace))
+                                     (BeamLisp.AOT/sdk_library_source? namespace source))
+                           (BeamLisp.Env/load_sdk_library! namespace)
+                           (write! :initialized (conj (read :initialized) namespace)))
+                          (let [definitions (BeamLisp.Env/ns_defs namespace)
+                                shim (BeamLisp.Emit/module_for namespace)
+                                routes (Enum/reduce definitions {}
+                                 (fn [pair out]
+                                  (Enum/reduce (elem pair 1) out
+                                   (fn [entry out]
+                                    (let [clause (elem entry 3)
+                                          body (when (> (erlang/tuple_size entry) 4) (elem entry 4))]
+                                     (Enum/reduce (list shim body) out
+                                      (fn [module out]
+                                       (if module
+                                        (assoc out [module (elem entry 2) (count (:params clause))] (elem pair 0))
+                                        out))))))))]
+                           {:definitions definitions :routes routes}))]
+              (write! :namespaces (maps/put namespace info (read :namespaces))) info)))
+          (module-namespace [module]
+            (if (contains? (read :modules) module) (get (read :modules) module)
+             (let [row (when (erlang/is_atom module)
+                         (BeamLisp.AOT/sdk_compiler_row module inventory))
+                   source (:source row)
+                   namespace (when source
+                               (BeamLisp.Loader/declared_ns
+                                (BeamLisp.Loader/read_source
+                                 (Path/join (elem inventory 0) source))))]
+              (write! :modules (maps/put module namespace (read :modules))) namespace)))]
+   (let [fixed-name? (fn [namespace]
+                       (let [source (when (string? namespace) (BeamLisp.Loader/source_path namespace))]
+                        (and source (BeamLisp.AOT/sdk_library_source? namespace source))))
+         canonical (Enum/reduce (to-list roots) []
+          (fn [target output]
+           (let [kind (first target)
+                 namespace (case kind :binding (second target) :namespace (second target)
+                             :remote (module-namespace (second target)) nil)]
+            (if-not (fixed-name? namespace) output
+             (let [info (sdk-namespace namespace)
+                   binding (when (= :remote kind)
+                             (get (:routes info) [(second target) (nth target 2) (nth target 3)]))]
+              (conj output (if binding [:binding namespace binding] target)))))))
+         bound-namespaces (set (map second (filter #(= :binding (first %)) canonical)))
+         ;; Cold global reads and warm compiler remotes denote the same SDK
+         ;; binding. A loader readiness guard adds no dependency beside it.
+         roots (vec (sort (set (remove
+                  #(and (= :namespace (first %)) (contains? bound-namespaces (second %))) canonical))))
+         key (when image-key [(elem inventory 0) (BeamLisp.AOTCache/compiler_key) image-key roots])
+         cached (when key (get @closures key))]
+    (if (and cached
+             (every? (fn [namespace] (BeamLisp.Env/ns_ready_in? (list :global) namespace)) cached))
+     true
+     (do
+      (write! :pending roots)
+   (loop []
+    (when (seq (read :pending))
+     (step!)
+     (let [target (peek (read :pending))]
+      (write! :pending (pop (read :pending)))
+      (when-not (contains? (read :seen) target)
+       (write! :seen (conj (read :seen) target))
+       (case (first target)
+        :namespace (sdk-namespace (second target))
+        :binding
+         (let [[_ namespace binding] target info (sdk-namespace namespace)]
+          (doseq [entry (get (:definitions info) binding)]
+           (let [clause (elem entry 3)] (walk (:guard clause)) (walk (:body clause)))))
+        :remote
+         (let [[_ module function arity] target namespace (module-namespace module)
+               info (when namespace (sdk-namespace namespace))
+               binding (get (:routes info) [module function arity])]
+          (when binding (enqueue! [:binding namespace binding])))
+        nil)))
+     (recur)))
+      ;; This memo is dependency DATA, never invocation/lifetime authority.
+      ;; SDK source/byte validation still runs before every preparation, and
+      ;; each miss initializes through the ordinary verified SDK loader.
+      (when key
+       (let [value (vec (sort (read :initialized)))]
+        (swap! closures
+         (fn [entries] (assoc (if (>= (count entries) 128) {} entries) key value)))))
+      true))))
+   (finally (Process/delete frame)))))
