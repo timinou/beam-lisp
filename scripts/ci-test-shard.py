@@ -45,6 +45,11 @@ def main():
                f"--setenv=PATH={os.environ.get('PATH', '')}",
                "--setenv=BL_TEST_TIMES=1",
                str(root / "bin/bl"), "--cold", "test", *selected]
+    # The user manager does not inherit the Actions step environment. Carry
+    # the producer's selected Rust identity across the same boundary as PATH.
+    if os.environ.get("RUSTUP_TOOLCHAIN"):
+        command.insert(command.index(str(root / "bin/bl")),
+                       f"--setenv=RUSTUP_TOOLCHAIN={os.environ['RUSTUP_TOOLCHAIN']}")
     runtime_parent = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     with tempfile.TemporaryDirectory(prefix="bl-ci-runtime-", dir=runtime_parent) as runtime:
         # Keep automatic checkout endpoints local to this shard. Preserve the
