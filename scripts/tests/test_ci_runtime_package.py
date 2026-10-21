@@ -42,7 +42,9 @@ class TestRuntimePackage(unittest.TestCase):
     def test_runtime_projection_keeps_the_prepared_inputs_and_modes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            for name in ("build/runtime.beam", "priv/native/runtime.so", "priv/z3/bin/z3"):
+            inputs = ("build/runtime.beam", "priv/native/runtime.so", "priv/z3/bin/z3",
+                      "tooling/drop/target/release/drop-launcher")
+            for name in inputs:
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(name.encode())
@@ -52,6 +54,7 @@ class TestRuntimePackage(unittest.TestCase):
             PACKAGE.package_runtime(root, bundle)
             with tarfile.open(bundle) as archive:
                 self.assertNotIn("unrelated", archive.getnames())
-                for name in ("build/runtime.beam", "priv/native/runtime.so", "priv/z3/bin/z3"):
+                self.assertFalse(any(name.endswith(".o") for name in archive.getnames()))
+                for name in inputs:
                     self.assertEqual(name.encode(), archive.extractfile(name).read())
                     self.assertTrue(archive.getmember(name).mode & 0o111)

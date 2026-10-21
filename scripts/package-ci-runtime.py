@@ -39,7 +39,7 @@ def package_store(store, destination):
 
 def package_runtime(root, destination):
     with tarfile.open(destination, "w:gz") as archive:
-        for relative in ("build", "priv/native", "priv/z3"):
+        for relative in ("build", "priv/native", "priv/z3", "tooling/drop/target/release/drop-launcher"):
             archive.add(root / relative, arcname=relative)
 
 
