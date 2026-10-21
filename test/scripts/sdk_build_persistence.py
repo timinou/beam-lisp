@@ -228,7 +228,10 @@ def main():
                 else sorted((Path.home() / '.cache/beam_lisp/ebin').glob('*/ebin')))
         use_systemd = bool(shutil.which('systemd-run') and shutil.which('systemctl')
             and subprocess.run(['systemctl', '--user', 'show-environment'], capture_output=True).returncode == 0)
-        command = ['elixir']
+        executable = shutil.which('elixir')
+        if not executable:
+            raise SystemExit('elixir is not on PATH')
+        command = [executable]
         for dep in deps:
             command += ['-pa', str(dep)]
         command += ['-pa', str(image / 'ebin'), str(driver)]
@@ -246,7 +249,9 @@ def main():
             if args.bootstrap_image:
                 env['PROBE_BOOTSTRAP'] = str(args.bootstrap_image.resolve())
                 cap += [f"--setenv=PROBE_BOOTSTRAP={env['PROBE_BOOTSTRAP']}"]
-            for key in ('BL_ROOT', 'PROBE_WORK', 'PROBE_PHASE', 'BEAM_LISP_AOT_CACHE_DIR', 'BL_DAEMON', 'ELIXIR_ERL_OPTIONS'):
+            # The user manager predates setup-beam/asdf/Nix's shell PATH.
+            # Elixir also resolves its erl child through that same PATH.
+            for key in ('PATH', 'BL_ROOT', 'PROBE_WORK', 'PROBE_PHASE', 'BEAM_LISP_AOT_CACHE_DIR', 'BL_DAEMON', 'ELIXIR_ERL_OPTIONS'):
                 cap += [f'--setenv={key}={env[key]}']
             try:
                 subprocess.run((cap if use_systemd else []) + command, env=env, check=True, timeout=300)
