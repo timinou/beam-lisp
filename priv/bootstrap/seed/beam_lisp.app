@@ -6,4 +6,5 @@
               {applications,[kernel,stdlib,elixir,logger,ssh,x509,bandit,
                              websock_adapter,file_system,explorer,req,
                              aws_signature,jason]},
-              {mod,{'Elixir.BeamLisp.Application',[]}}]}.
+              {mod,{'Elixir.BeamLisp.Application',[]}},
+              {env,[]}]}.
