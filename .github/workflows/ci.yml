@@ -36,7 +36,14 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+
+# Each new PR revision supersedes its unfinished checks. Draft edits run the
+# cheap checks; marking ready or dispatching CI runs the complete qualification.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -51,8 +58,8 @@ jobs:
           fetch-depth: 0
       - name: Embedded test library matches its source
         run: python3 scripts/embed-test-library.py --check
-      - name: Synthetic publication boundary controls
-        run: python3 -m unittest discover -s scripts/tests -p test_public_evidence.py
+      - name: CI, embedding and publication boundary controls
+        run: python3 -m unittest discover -s scripts/tests
       - name: Inspect every new commit blob before native builds
         env:
           PUBLIC_EVIDENCE_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -65,15 +72,11 @@ jobs:
             python3 scripts/check-public-evidence.py --head HEAD
           fi
 
-  test:
-    strategy:
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+  prepare-linux:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     needs: public-evidence
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -144,27 +147,103 @@ jobs:
         with:
           path: |
             ~/.cache/beam_lisp
-          key: ci-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bl.lock', '**/Cargo.lock') }}
+          key: ci-${{ runner.os }}-${{ runner.arch }}-otp29-elixir1.20-${{ hashFiles('bl.lock', 'native/**', 'tooling/drop/**') }}
           restore-keys: |
-            ci-${{ runner.os }}-${{ runner.arch }}-
+            ci-${{ runner.os }}-${{ runner.arch }}-otp29-elixir1.20-
 
       - name: dependencies — bl alone, fetch then compile for this runtime
         run: |
-          ./bin/bl deps fetch
-          ./bin/bl deps compile
+          ./bin/bl --cold deps fetch
+          ./bin/bl --cold deps compile
 
       # Runtime startup retains the immutable SDK. Compiler regeneration runs
       # in the bare VM below; this step prepares natives and app metadata.
       - name: Prepare natives and application metadata
         run: ./bin/bl --cold run scripts/prepare-release.bl
 
+      - name: Fetch the pinned solver used by integration tests
+        run: ./bin/bl --cold install z3
+
+      # One producer for this run and revision. Tar preserves native executable
+      # modes; consumers restore the addressed cache to the same HOME layout.
+      - name: Package the prepared Linux runtime
+        run: |
+          set -eu
+          tar -czf "$RUNNER_TEMP/ci-runtime.tar.gz" build priv/native priv/z3
+          tar -czf "$RUNNER_TEMP/ci-store.tar.gz" -C "$HOME" .cache/beam_lisp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-linux-runtime
+          path: |
+            ${{ runner.temp }}/ci-runtime.tar.gz
+            ${{ runner.temp }}/ci-store.tar.gz
+          compression-level: 0
+          retention-days: 1
+
+  test:
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    needs: prepare-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29.0"
+          elixir-version: "1.20"
+      - name: Install native runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-0t64 libwebkit2gtk-4.1-0 libgtk-layer-shell0 tesseract-ocr
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-linux-runtime
+          path: ${{ runner.temp }}/ci-linux-runtime
+      - name: Restore this revision's prepared runtime
+        run: |
+          set -eu
+          tar -xzf "$RUNNER_TEMP/ci-linux-runtime/ci-runtime.tar.gz"
+          tar -xzf "$RUNNER_TEMP/ci-linux-runtime/ci-store.tar.gz" -C "$HOME"
+      # The complete corpus, one serial capped VM per runner. No dependency or
+      # native compilation is repeated by the eight consumers.
+      - name: test partition
+        run: python3 scripts/ci-test-shard.py --index ${{ matrix.shard }} --count 8
+
+  qualify-linux:
+    needs: [prepare-linux, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29.0"
+          elixir-version: "1.20"
+      - name: Install native runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-0t64 libwebkit2gtk-4.1-0 libgtk-layer-shell0 tesseract-ocr
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-linux-runtime
+          path: ${{ runner.temp }}/ci-linux-runtime
+      - name: Restore this revision's prepared runtime
+        run: |
+          set -eu
+          tar -xzf "$RUNNER_TEMP/ci-linux-runtime/ci-runtime.tar.gz"
+          tar -xzf "$RUNNER_TEMP/ci-linux-runtime/ci-store.tar.gz" -C "$HOME"
       # The committed floor (priv/bootstrap/seed) is a self-hosted fixpoint:
       # regenerating it from this tree reproduces every byte. A change to
       # priv/boot, priv/host or the emitter that was not followed by
       # `scripts/regenerate-seed`, or anything that makes a beam depend on the
       # machine or the run, shows up here as a diff.
       - name: the floor reproduces itself
-        if: matrix.shard == 0
         run: |
           set -eu
           out="$RUNNER_TEMP/regen"
@@ -179,21 +258,13 @@ jobs:
           diff -r priv/bootstrap/seed "$out/seed"
 
       - name: Kernel file custody excludes independent processes and survives crashes
-        if: matrix.shard == 0
-        run: python3 test/scripts/file_locks.py --image "$PWD/.bl/lib/beam_lisp-0.1.0"
-
-      # The entire corpus is partitioned, with one serial VM per runner.
-      # A monolithic run previously hit the job ceiling before half the files.
-      - name: Fetch the pinned solver used by integration tests
-        run: ./bin/bl --cold install z3
-
-      - name: test partition
-        run: python3 scripts/ci-test-shard.py --index ${{ matrix.shard }} --count 8
+        run: |
+          ./bin/bl --cold version
+          python3 test/scripts/file_locks.py --image "$PWD/.bl/lib/beam_lisp-0.1.0"
 
       - name: the drop builds itself, and the result runs
-        if: matrix.shard == 0
         run: |
-          ./bin/bl self-build --out /tmp/bl-self
+          ./bin/bl --cold self-build --out /tmp/bl-self
           /tmp/bl-self version
           /tmp/bl-self eval '(println (+ 40 2))' | grep -qx 42
 
@@ -201,7 +272,7 @@ jobs:
   # gate — the drop evaluates, its glibc floor is <= the servers' 2.40 — and the pin
   # check keeps this flake's nixpkgs equal to Foundry's.
   nix-drop:
-    needs: public-evidence
+    needs: test
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:

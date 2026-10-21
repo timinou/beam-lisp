@@ -38,334 +38,47 @@ on:
         required: false
         default: ""
 
+# Superseded branch candidates are disposable. Tagged releases are allowed
+# to finish, and have a separate concurrency group from main/dispatch builds.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
 permissions:
   contents: write
 
 jobs:
+  # Common SDK regressions must pass on Linux before spending three more
+  # native builds. Both stages call the same build and qualification workflow.
+  linux:
+    uses: ./.github/workflows/build-drop.yml
+    with:
+      artifact: linux-x86_64
+      runner: ubuntu-24.04
+      version: ${{ inputs.version || '' }}
+
   build:
-    name: ${{ matrix.artifact }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    needs: linux
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
-          - artifact: linux-x86_64
-            runner: ubuntu-24.04
-            # z3's pinned linux x64 asset is built against glibc 2.39, so the
-            # runner must be ≥ 24.04 (its `bl install z3` smoke-runs
-            # the binary). This sets the drop's glibc floor in turn.
           - artifact: linux-aarch64
             runner: ubuntu-24.04-arm
           - artifact: macos-arm64
             runner: macos-15
           - artifact: macos-x86_64
-            # macos-13 (the last Intel image) was retired 2025-12;
-            # macos-15-intel is its supported replacement (until 2027-08).
             runner: macos-15-intel
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up OTP 29 + Elixir 1.20
-        uses: erlef/setup-beam@v1
-        with:
-          otp-version: "29"
-          elixir-version: "1.20"
-
-      - name: Resolve version
-        id: version
-        run: |
-          set -eu
-          v="${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}"
-          v="${v#v}"
-          [ -n "$v" ] || v="0.1.0-dev"
-          # A push to main is `latest`: a prerelease of the next version, named
-          # by its commit, so `bl version` says which main it is.
-          if [ "${{ github.ref_type }}" = branch ] && [ -z "${{ inputs.version }}" ]; then
-            v="0.1.0-latest.${GITHUB_SHA:0:8}"
-          fi
-          # Elixir's Version is major.minor.patch, so a CalVer tag like `v2026.0`
-          # is stamped as `2026.0.0`. The GitHub release keeps the tag's name;
-          # only the app version (what `bl version` reports) is normalized.
-          case "$v" in
-            *.*.*) ;;
-            *.*) v="$v.0" ;;
-            *)   v="$v.0.0" ;;
-          esac
-          echo "BL_VERSION=$v" >> "$GITHUB_ENV"
-          echo "value=$v" >> "$GITHUB_OUTPUT"
-          echo "building beam-lisp $v for ${{ matrix.artifact }} (ref ${{ github.ref_name }})"
-
-      # The one artefact the language cannot build for itself. `priv/native` is a
-      # build output (`.gitignore` says so; the native stage installs it), and the
-      # boot needs `priv/native/lazy_memo` before any step that could build it has
-      # run: `BeamLisp.LazyMemo.load_nif!/0` loads from ONE path with no fallback
-      # and the prelude interns LazySeq, so a runner without it dies at the first
-      # `bl` call with "BeamLisp LazySeq requires the lazy_memo native runtime".
-      #
-      # No `bl` command can produce it — `bl` is what needs it. Cargo can: the
-      # crate is an ordinary cdylib.
-      #
-      # `priv/native` is DELIBERATELY not in the cache below. Its cache key is
-      # `hashFiles('bl.lock','**/Cargo.lock')`, which does not change when a
-      # crate's `src/lib.rs` changes its NIF surface without touching Cargo.lock
-      # — so a cached `.so` can export a function the current `.ex` no longer
-      # declares (or lack one it now requires), and the first `bl` call boots
-      # against it and dies `{:bad_lib, Function not found …}`. This exact class
-      # broke every v2026.4 macOS release build: a cached `lazy_memo.so` still
-      # exported `nif_lane/1` after PLAN-132 Phase 1 removed it. `native/*/target`
-      # stays cached, so this cargo build is still incremental; only the installed
-      # artefact is rebuilt from THIS tree's source, every run.
-      - name: Bootstrap the native crates the boot needs
-        run: |
-          set -eu
-          mkdir -p priv/native
-          case "$(uname -s)" in Darwin) ext=dylib ;; *) ext=so ;; esac
-          cargo build --release --manifest-path native/lazy_memo/Cargo.toml
-          install -m 755 "native/lazy_memo/target/release/liblazy_memo.$ext" \
-                          priv/native/lazy_memo.so
-          ls -l priv/native
-
-      # `build/` (the boot+std AOT tier) is DELIBERATELY not cached, for the same
-      # reason as `priv/native` above: the cache key is
-      # `hashFiles('bl.lock','**/Cargo.lock')`, which does not move when a
-      # `priv/boot/` or `priv/std/` SOURCE changes. `restore-keys` prefix-fallback
-      # then restores an old `build/` on every run, and the launcher's generation
-      # check serves that stale tier while the committed floor is current — the
-      # exact "two generations in one VM" the launcher warns about, which dies
-      # `undefined var: compiler/special-forms` compiling anf.bl against a floor
-      # whose compiler no longer matches. `bl build --force` rebuilds the whole
-      # tier from THIS tree every run; `~/.cache/beam_lisp` (the content-addressed
-      # AOT cache, keyed per-namespace by source closure) stays cached, so a
-      # rebuild is still incremental where the sources did not move.
-      - name: Cache deps, builds, and cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/beam_lisp
-            ~/.cargo/registry
-            ~/.cargo/git
-            native/*/target
-            tooling/drop/target
-            priv/embed
-          key: ${{ matrix.artifact }}-${{ hashFiles('bl.lock', '**/Cargo.lock') }}
-          restore-keys: |
-            ${{ matrix.artifact }}-
-
-      # wry_webview is a Linux-only capability (gtk + webkit2gtk +
-      # wlr-layer-shell). Its Cargo.toml target-gates those deps and lib.rs is
-      # crate-level `cfg(target_os = "linux")`, so the macOS legs compile it to
-      # an empty cdylib and `wry/*` reads as ABSENT — the doctrine for a native
-      # capability that cannot be built here. On Linux the headers must exist.
-      - name: Install WebKitGTK toolchain (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libgtk-3-dev libwebkit2gtk-4.1-dev libgtk-layer-shell-dev
-
-      # The version lives in the DECLARATION (env.bl `:app :vsn`) — that is what
-      # the app resource is written from, and the app resource is what the
-      # release assembly reads — so the release stamps it there instead of
-      # passing it through a build tool's environment. Both occurrences: the
-      # application's own vsn and the release's.
-      - name: Stamp the version into env.bl
-        run: |
-          set -eu
-          perl -pi -e "s/:vsn \"0\.1\.0\"/:vsn \"$BL_VERSION\"/" env.bl
-          grep -n ':vsn' env.bl
-
-      # Dependencies, with no Mix: `bl deps fetch` obtains every locked tarball
-      # into the content-addressed store (verifying the digest the lock names),
-      # and `bl deps compile` builds each one for THIS runtime.
-      - name: Dependencies
-        run: |
-          ./bin/bl deps fetch --cold
-          ./bin/bl deps compile --cold
-
-      # The checked compiler floor is reused. Native libraries and release
-      # metadata are prepared independently; library tiers ship as source.
-      - name: Prepare native libraries and application metadata
-        run: ./bin/bl --cold run scripts/prepare-release.bl
-
-      # Release builds consume the qualified, committed compiler floor. A source
-      # mismatch must fail qualification rather than silently replace that floor.
-      - name: Verify committed native bootstrap floor
-        run: ./bin/bl --cold seed --check
-
-      - name: Fetch the pinned z3 solver
-        run: ./bin/bl --cold install z3
-
-      # The embedding weights travel INSIDE the drop, so they are fetched into
-      # the BUNDLED copy here (`bl install embed DIR` writes into DIR) — and for
-      # the cache: a miss costs one 33 MB download per leg, and a stale entry is
-      # re-verified against the pinned sha256 and refetched.
-      - name: Fetch the code-embedding weights (bundled into the drop)
-        run: ./bin/bl --cold install embed priv/embed/potion-code-16M-v2
-
-      # Apple Silicon refuses to exec unsigned Mach-O pages. Cargo/ld ad-hoc
-      # sign what they produce, but the z3 release archive is not necessarily
-      # signed — sign it (and its dylib) before the release copies priv/ into
-      # the payload. The signature rides in the file, so extraction preserves it.
-      - name: Ad-hoc sign native binaries (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          set -eu
-          find priv/z3 -type f \( -name z3 -o -name '*.dylib' \) -exec codesign --force --sign - {} \;
-          find priv/z3 -type f \( -name z3 -o -name '*.dylib' \) -exec codesign --verify --verbose=1 {} \;
-
-      # cargo builds the STOCK launcher — the one non-beam-lisp piece a drop
-      # needs, and cargo is not Mix. `bl self-build` then assembles the release
-      # tree from THIS checkout, compiles the staged tier sources, seals the tree
-      # with that launcher, and verifies the compound against its own trailer.
-      - name: Build the drop
-        run: |
-          set -eu
-          cargo build --release --manifest-path tooling/drop/Cargo.toml
-          ./bin/bl --cold self-build \
-            --bin tooling/drop/target/release/drop-launcher \
-            --out "bl-${{ matrix.artifact }}" \
-            --reuse-floor
-
-      - name: Verify persistent SDK builds restore without initialization
-        run: |
-          image=$(python3 -c 'import glob,tempfile; print(glob.glob(tempfile.gettempdir()+"/bl-selfbuild/tree/lib/beam_lisp-*")[0])')
-          python3 test/scripts/sdk_build_persistence.py --image "$image"
-          python3 test/scripts/file_locks.py --image "$image"
-
-      - name: Verify fresh SDK startup uses compiled units
-        run: python3 test/scripts/drop_startup.py "bl-${{ matrix.artifact }}" --samples 1 --runtime-regressions
-
-      # A drop gets launched in parallel more often than it looks — an editor
-      # opening two workspaces, `bl realm start` beside a `bl run`, two jobs
-      # on one machine. The first launch of a version extracts ~100 MB, and
-      # that staging path used to be shared and deterministic: racers deleted
-      # each other's work mid-unpack ("first-run extraction failed: failed to
-      # unpack … into …/drop/<sha8>.tmp/…"). This step is that wave, on a
-      # runner whose install dir is EMPTY — it must run before the smoke
-      # below, because that one extracts this same payload and would leave the
-      # directory warm.
-      - name: Smoke test (concurrent first launch)
-        run: |
-          set -eu
-          cp "bl-${{ matrix.artifact }}" "$RUNNER_TEMP/bl-race"
-          chmod +x "$RUNNER_TEMP/bl-race"
-          cd "$RUNNER_TEMP"
-          pids=""
-          for i in 1 2 3 4 5 6 7 8; do
-            ( ./bl-race --cold version >"race-$i.out" 2>&1 ) &
-            pids="$pids $!"
-          done
-          fail=0
-          for p in $pids; do wait "$p" || fail=1; done
-          for i in 1 2 3 4 5 6 7 8; do
-            echo "race-$i: $(cat "race-$i.out")"
-            grep -q "beam-lisp " "race-$i.out" || fail=1
-          done
-          if [ "$fail" -ne 0 ]; then
-            echo "FAIL: a concurrent first launch did not answer" >&2
-            exit 1
-          fi
-
-      # The drop must run with NO warm VM and NO checkout: this is the artifact
-      # a user downloads, exercised exactly as they would. It is copied out of
-      # the workspace first, so a namespace that the payload is missing cannot
-      # be papered over by the checkout's own sources. Every assertion is a
-      # live native surface — the language, a Rust NIF (fjall), the core
-      # lazy_memo runtime, Explorer/Polars, and the z3 port — so a payload that
-      # silently lost its native tier fails here rather than on a user's machine.
-      - name: Smoke test (cold, no warm VM, no checkout)
-        run: |
-          set -eu
-          cp "bl-${{ matrix.artifact }}" "$RUNNER_TEMP/bl"
-          chmod +x "$RUNNER_TEMP/bl"
-          cd "$RUNNER_TEMP"
-          BL="./bl"
-          expect() {
-            got="$("$BL" --cold eval "$3" 2>&1 | tail -n1)"
-            if [ "$got" != "$2" ]; then
-              echo "FAIL $1: expected '$2', got '$got'" >&2
-              exit 1
-            fi
-            echo "ok  $1 → $got"
-          }
-          got="$("$BL" --cold version --short | tail -n1)"
-          if [ "$got" != "beam-lisp $BL_VERSION" ]; then
-            echo "FAIL version: expected 'beam-lisp $BL_VERSION', got '$got'" >&2
-            exit 1
-          fi
-          echo "ok  version → $got"
-          expect language   3      '(+ 1 2)'
-          expect datom_fjall true  '(datom.store-fjall/available?)'
-          expect explorer   true   '(datom.frame/available?)'
-          expect lazy_memo  65536  '(BeamLisp.LazyMemo/fast_lane_bytes)'
-
-          # The oracle answers a STATUS MAP on the oracle tier and a bare string
-          # on the older port. This check used to demand the string and so failed
-          # a release whose solver was working — observed on all four targets:
-          #
-          #     FAIL z3: expected 'sat', got '{:status :sat, :core [], :why nil,
-          #     :tier :oracle, :model {}, …}'
-          #
-          # `bl doctor` already learned this (its probe reads whichever shape is
-          # there, with the measurement written down). Ask for the status and
-          # accept both, so a shape change cannot fail a build again.
-          z3_out="$("$BL" --cold eval '(let [p (z3/open) r (z3/check p "(assert true)")] (or (:status r) r))' 2>&1 | tail -n1)"
-          case "$z3_out" in
-            *sat*) echo "ok  z3 → $z3_out" ;;
-            *) echo "FAIL z3: expected a status naming sat, got '$z3_out'" >&2; exit 1 ;;
-          esac
-
-          # The two stdio servers, from a cwd that has no beam-lisp sources in
-          # it at all — which is the point: everything they need comes from the
-          # installed priv tier. `bl mcp` mounts a codebase, and a mount that
-          # resolved "priv/std/codebase.bl" against the cwd answered nothing
-          # here (the reader got `:enoent` as source text) while working fine
-          # from a checkout.
-          mcp_req='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"code/list","arguments":{}},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}'
-          got="$(printf '%s\n' "$mcp_req" | "$BL" --cold mcp 2>/dev/null | head -n1)"
-          case "$got" in
-            *'"codebases"'*'"functions":'*)
-              echo "ok  mcp → served a mounted codebase" ;;
-            *)
-              echo "FAIL mcp: expected a code/list result, got '$got'" >&2; exit 1 ;;
-          esac
-
-          lsp_body='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}'
-          got="$(printf 'Content-Length: %s\r\n\r\n%s' "${#lsp_body}" "$lsp_body" \
-                 | "$BL" --cold lsp serve 2>/dev/null | head -c 200)"
-          case "$got" in
-            *'"capabilities"'*)
-              echo "ok  lsp serve → answered initialize" ;;
-            *)
-              echo "FAIL lsp serve: expected an initialize result, got '$got'" >&2; exit 1 ;;
-          esac
-
-      - name: Checksum
-        run: |
-          set -eu
-          f="bl-${{ matrix.artifact }}"
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "$f" > "$f.sha256"
-          else
-            shasum -a 256 "$f" > "$f.sha256"
-          fi
-          cat "$f.sha256"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: bl-${{ matrix.artifact }}
-          path: |
-            bl-${{ matrix.artifact }}
-            bl-${{ matrix.artifact }}.sha256
-          # The payload is already gzip; re-zipping ~100 MB per leg buys nothing.
-          compression-level: 0
-          retention-days: 7
+    uses: ./.github/workflows/build-drop.yml
+    with:
+      artifact: ${{ matrix.artifact }}
+      runner: ${{ matrix.runner }}
+      version: ${{ inputs.version || '' }}
 
   publish-latest:
     name: publish latest (rolling)
     if: github.ref_type == 'branch' && github.ref_name == 'main'
-    needs: build
+    needs: [linux, build]
     runs-on: ubuntu-24.04
     # One `latest` at a time: a newer push supersedes an older one mid-upload.
     concurrency:
@@ -404,7 +117,7 @@ jobs:
   publish:
     name: publish release
     if: github.ref_type == 'tag'
-    needs: build
+    needs: [linux, build]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
