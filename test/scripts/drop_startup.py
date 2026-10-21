@@ -112,6 +112,13 @@ BeamLisp.Launcher.start_app!(["run", Path.join(__DIR__, "hello.bl")], %{halt: ha
             result = subprocess.run(
                 [str(artifact), 'eval', '(println (str "OWNER " (System/pid)))'],
                 cwd=directory, env=env, text=True, capture_output=True, timeout=180)
+            if result.returncode:
+                # Keep the actual startup cause in CI output before the private
+                # fixture is removed. A readiness timeout alone hides whether
+                # the child failed to bind, load, or initialize its session.
+                for log in sorted((directory / 'state').rglob('*.log')):
+                    print(f'FAILED WARM START {log.relative_to(directory)}:\n'
+                          + log.read_text(errors='replace')[-12000:], flush=True)
             assert result.returncode == 0, result.stdout + result.stderr
             owner = int(next(line[6:] for line in result.stdout.splitlines()
                              if line.startswith('OWNER ')))

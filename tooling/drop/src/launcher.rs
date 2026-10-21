@@ -545,7 +545,11 @@ fn retry_from_warm(bin: &std::path::Path, root: &std::path::Path, argv: &[String
     }
     if t == Transport::Require {
         if !wait_ready(root, shared) {
-            eprintln!("bl: required warm VM did not become ready; service was not run (see `bl vm logs`)");
+            if let Some(log) = log_path(root, &build_id(), shared) {
+                eprintln!("bl: required warm VM did not become ready; command was not run; log: {}", log.display());
+            } else {
+                eprintln!("bl: required warm VM did not become ready; command was not run (see `bl vm logs`)");
+            }
             return Some(1);
         }
         return Some(after_attach(try_attach(root, argv, shared)).unwrap_or_else(|| {
