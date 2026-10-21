@@ -629,13 +629,20 @@
                        (= "invoke" function))))
     (refuse! :unmanaged-compiled-producer {:namespace name :symbol symbol})))))
 
+(defn- compiler-data-target? [module function arity]
+ ;; Audited macros emit these bounded-arity spec constructors. Raw Source
+ ;; spellings still require their original native grant before expansion.
+ (and (= :Elixir.BeamLisp.Supervisor module) (= :server function)
+      (contains? #{2 3 4} arity)))
+
 (defn- compile-exact [planned form env]
  (syntax-constructor/with-expansion! (fn []
   (let [native (native-call/specialize
                 (declaration/specialize-registrations! (BeamLisp.Compiler/compile form (assoc env :managed-source true)))
-                (fn [{:keys [module function]}]
+                (fn [{:keys [module function arity]}]
                  (let [name (String/replace_prefix (erlang/atom_to_binary module :utf8) "Elixir." "")]
-                  (when-not (contains? (:native-modules planned) name)
+                  (when-not (or (contains? (:native-modules planned) name)
+                                (compiler-data-target? module function arity))
                    (refuse! :undeclared-native-target {:module name :function function}))
                   (when (native-hazard? module function)
                    (refuse! :unmanaged-compiled-producer {:module module :function function})))))
@@ -802,12 +809,29 @@
  (sdk-readiness/prepare! @(:sdk-readiness planned)))
 
 (def ^:private immutable-remotes
- #{[:Elixir.BeamLisp.Supervisor :server]
-   ;; Forcing native constructors require bounded first-order input below.
+ #{;; Forcing native constructors require bounded first-order input below.
    [:Elixir.BeamLisp.Ns.Rt :hash_key] [:Elixir.BeamLisp.Ns.Clojure.Re :re-pattern]
    [:Elixir.BeamLisp.Ns.Core :merge__bl_v]
    [:Elixir.BeamLisp.Ns.Core :vector__bl_v] [:Elixir.BeamLisp.Ns.Core :list__bl_v]
    [:Elixir.BeamLisp.Ns.Core :str__bl_v] [:Elixir.Regex :compile!]})
+
+(defn- sdk-pool-data-constructor? [node]
+ ;; The ordinary SDK pool adapter constructs data and starts nothing. Match
+ ;; its actual fixed binding and immutable SDK bytes, never a spelling alone.
+ ;; A pool has a dispatcher as well as workers; the managed tree admits at
+ ;; most 4096 children. Refuse a huge constructor before materializing it.
+ (let [args (:args node) size (when (= 3 (count args)) (nth args 2))]
+  (and (= :pool-spec (:fun node))
+       (= :lit (:op size)) (integer? (:val size)) (<= 1 (:val size) 4095)
+       (some (fn [entry]
+               (and (= :fixed (elem entry 0)) (= 3 (elem entry 1))
+                    (= (:fun node) (elem entry 2))
+                    (or (= (:mod node) (BeamLisp.Emit/module_for "proc.super"))
+                        (and (> (erlang/tuple_size entry) 4) (= (:mod node) (elem entry 4))))))
+             (BeamLisp.Env/ns_definition "proc.super" "pool-spec"))
+       (try (BeamLisp.AOT/sdk_callable_evidence!
+              (erlang/make_fun (:mod node) (:fun node) 3)) true
+            (catch _ false)))))
 
 (defn- record-factory! [targets namespace definition]
  ;; Incremental per-definition index: do not materialize/rescan the whole
@@ -849,6 +873,17 @@
                                                  (:clauses (:node closure))))]
              (and (seq clauses) (every? #(safe % bindings active (inc depth)) arguments)
                   (every? #(clause-safe? % (:bindings closure) active (inc depth)) clauses))))
+          (pattern-bindings [pattern bindings depth]
+           ;; Literal native apply specialization matches its evaluated proper
+           ;; argument list before calling the exact target. Prove this finite
+           ;; data pattern without evaluating the constructor during analysis.
+           (budget! depth)
+           (case (:pop pattern)
+            :pvar (when (string? (:name pattern)) (assoc bindings (:name pattern) :immutable))
+            :pnil bindings
+            :pcons (when-let [head (pattern-bindings (:head pattern) bindings (inc depth))]
+                     (pattern-bindings (:tail pattern) head (inc depth)))
+            nil))
           (safe [n bindings active depth]
            (budget! depth)
            (if-not (map? n) false
@@ -866,6 +901,12 @@
                                                  {:node (:init n) :bindings bindings} :immutable))
                       active (inc depth)))
              :apply (call-local? (:fn n) (:args n) bindings active depth)
+             :case (and (safe (:subj n) bindings active (inc depth)) (seq (:clauses n))
+                      (every? (fn [clause]
+                        (and (= 1 (count (:pats clause)))
+                         (when-let [locals (pattern-bindings (first (:pats clause)) bindings (inc depth))]
+                          (and (or (nil? (:guard clause)) (safe (:guard clause) locals active (inc depth)))
+                               (safe (:body clause) locals active (inc depth)))))) (:clauses n)))
              :if (every? #(safe % bindings active (inc depth)) [(:test n) (:then n) (:else n)])
              :map (every? #(every? (fn [v] (safe v bindings active (inc depth))) %) (:pairs n))
              :cons (and (safe (:head n) bindings active (inc depth)) (safe (:tail n) bindings active (inc depth)))
@@ -876,7 +917,9 @@
              :remote
               (let [target [(:mod n) (:fun n) (count (:args n))] clause (get targets target)]
                (cond
-                (contains? immutable-remotes [(:mod n) (:fun n)])
+                (or (contains? immutable-remotes [(:mod n) (:fun n)])
+                    (compiler-data-target? (:mod n) (:fun n) (count (:args n)))
+                    (sdk-pool-data-constructor? n))
                  (every? #(safe % bindings active (inc depth)) (:args n))
                 (and (= :Elixir.BeamLisp.Loader (:mod n)) (= :ensure_ready (:fun n))
                      (= 1 (count (:args n))) (= :lit (:op (first (:args n)))))
@@ -1256,13 +1299,13 @@
  (let [declared (get-in generation [:resources :dynamic-store-policy])
        loaded? (env/with-env :global #(BeamLisp.Env/ns_ready? "datom.conn"))
        installed? (when loaded?
-          ((env/with-env :global #(BeamLisp.AOT/sdk_named_constructor! "datom.conn" "migration-policy-installed?" 1))
+          ((BeamLisp.Env/sdk_callable! "datom.conn" "migration-policy-installed?" 1)
              (:application-id generation)))]
   (when (and installed? (nil? declared)) (refuse! :migration-policy-declaration-required {}))
   (if declared
    (execution/with! generation
     (fn []
-     ((env/with-env :global #(BeamLisp.AOT/sdk_named_constructor! "datom.conn" "with-migration-publication-reservation!" 1)) action)))
+     ((BeamLisp.Env/sdk_callable! "datom.conn" "with-migration-publication-reservation!" 1) action)))
    (action))))
 
 (defn publish!
@@ -1439,8 +1482,7 @@
  ;; Fixed SDK exact definition receipt, never a user callback/namespace prefix.
  ;; Optional lazy seam avoids eager generation <-> queue module dependency.
  (when (env/with-env :global #(BeamLisp.Env/loaded_ns? "proc.queue-family-root"))
-  (let [f (env/with-env :global
-     #(BeamLisp.AOT/sdk_named_constructor! "proc.queue-family-root" operation 1))]
+  (let [f (BeamLisp.Env/sdk_callable! "proc.queue-family-root" operation 1)]
    (f generation))))
 
 (defn- retirement-key [generation]
@@ -1570,8 +1612,7 @@
 (defn- conn-retirement [generation]
  ;; Optional exact SDK producer receipt; no supplied callback or eager import.
  (when (env/with-env :global #(BeamLisp.Env/loaded_ns? "reload.conn-retention"))
-  (let [f (env/with-env :global
-            #(BeamLisp.AOT/sdk_named_constructor! "reload.conn-retention" "release-retired!" 1))]
+  (let [f (BeamLisp.Env/sdk_callable! "reload.conn-retention" "release-retired!" 1)]
    (f generation))))
 
 (defn- retirement-step! [generation stage action]
