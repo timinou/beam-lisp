@@ -3592,7 +3592,15 @@
                             ;; Existing SDK lifetime: extend BEFORE initializer
                             ;; effects, for image and ordinary cached source alike.
                             (BeamLisp.Env/refresh_sdk_runtime!)
-                            (do (ensure_source_sdk_evidence! ns mod)
+                            (do
+                                ;; A lazy boot namespace belongs to the verified
+                                ;; floor, not an ordinary source-cache unit. Its
+                                ;; exact seed artifact is already the SDK issuer.
+                                (when-not (and (floor_file? source)
+                                               (= mod (BeamLisp.Emit/module_for ns))
+                                               (or (seed_dependency! mod)
+                                                   (seed_forwarder_dependency_from_manifest! mod (BeamLisp.Bootstrap/manifest))))
+                                  (ensure_source_sdk_evidence! ns mod))
                                 (BeamLisp.Env/refresh_sdk_runtime!))))))
                     (let [initializer (namespace_initializer ns mod)]
                       (when-not initializer (erlang/error (tuple :namespace_initializer_missing ns)))
@@ -5415,13 +5423,13 @@
  (throw (ex-info "Bounded constructor interpretation refused"
                  {:kind :constructor-machine-refused :detail detail})))
 (defn- constructor_counter! [state field delta]
- (let [key (:counter-frame state) counters (erlang/get key)]
+ (let [key (maps/get :counter-frame state nil) counters (erlang/get key)]
   (when-not (and (erlang/is_map counters) (erlang/is_map_key field counters))
    (constructor_refuse :missing-counter-frame))
-  (let [next (+ (erlang/map_get field counters) delta)]
+  (let [next (erlang/+ (erlang/map_get field counters) delta)]
    (erlang/put key (maps/put field next counters)) next)))
 (defn- constructor_step! [state]
- (when (neg? (constructor_counter! state :remaining -1)) (constructor_refuse :step-budget)))
+ (when (erlang/< (constructor_counter! state :remaining -1) 0) (constructor_refuse :step-budget)))
 ;; Data-shape walks (recipe presence, internal cost) are bounded per call by
 ;; the aggregate node budget, but they re-run at every primitive boundary over
 ;; values that grow with the program (a defserver clause plan). Charging them
@@ -5430,9 +5438,9 @@
 ;; are charged to their own :walk-steps budget instead; a frame without one
 ;; (hand-built fixtures) keeps the old shared accounting.
 (defn- constructor_walk_step! [state]
- (let [counters (erlang/get (:counter-frame state))]
+ (let [counters (erlang/get (maps/get :counter-frame state nil))]
   (if (and (erlang/is_map counters) (erlang/is_map_key :walk-steps counters))
-   (when (neg? (constructor_counter! state :walk-steps -1)) (constructor_refuse :walk-budget))
+   (when (erlang/< (constructor_counter! state :walk-steps -1) 0) (constructor_refuse :walk-budget))
    (constructor_step! state))))
 
 (defn- constructor_container_cost! [value state]
@@ -5942,6 +5950,25 @@
                      :detail :opaque-finite-recipe-observation :operation target}))))))
 
 (defn- constructor_internal_cost! [value state]
+ ;; Terms are immutable and the machine's callable/recipe membership only
+ ;; grows within this private frame. Remember successful raw shape/cost checks
+ ;; by exact term; allocation sites still charge the returned cost every time.
+ ;; Never retain a failed check or reuse this data across interpreter calls.
+ (constructor_walk_step! state)
+ (let [key (maps/get :counter-frame state) frame (erlang/get key)
+       cache (Map/get frame :cost-cache {}) hit (maps/find value cache)]
+  (if (not= :error hit) (elem hit 1)
+   (let [cost (constructor_internal_cost_uncached! value state)
+         frame (erlang/get key) cache (Map/get frame :cost-cache {})
+         used (Map/get frame :cost-cache-bytes 0)
+         size (when (and (> (:nodes cost) 32) (< (erlang/map_size cache) 128))
+                (erlang/external_size value))]
+    (when (and size (<= (+ used size) 4194304))
+     (erlang/put key (maps/put :cost-cache (maps/put value cost cache)
+                        (maps/put :cost-cache-bytes (+ used size) frame))))
+    cost))))
+
+(defn- constructor_internal_cost_uncached! [value state]
  ;; No protocol/Enumerable/callback inspection. Fn values are interpreter-owned
  ;; internal capabilities; source literal/input endpoints reject them. Captured
  ;; environments are charged independently when each capability is constructed.
@@ -6024,12 +6051,20 @@
     (constructor_refuse :keyword-name-budget))
    (constructor_atom! token state))))
 
+(defn- constructor_data_limits []
+ ;; SDK syntax is authenticated source, not an application datum. Use the
+ ;; machine's existing aggregate ceiling for its input/expanded syntax while
+ ;; keeping the public first-order domain's smaller default unchanged. The
+ ;; private staging context selects this, never caller metadata/options.
+ (if (constructor_context)
+  {:max-nodes 65536 :max-bytes 1048576 :max-depth 128} {}))
+
 (defn- constructor_readable! [value state]
  ;; The runtime printer may force deferred objects or invoke Inspect for foreign
  ;; types. Only the shared raw first-order domain is admitted here; no internal
  ;; callback/capsule or protocol-backed object reaches the printer.
- (BeamLisp.CompilerData/check_first_order! value)
- (let [cost (BeamLisp.CompilerData/first_order_cost! value)
+ (BeamLisp.CompilerData/check_first_order! value (Map/get state :data-limits {}))
+ (let [cost (BeamLisp.CompilerData/first_order_cost! value (Map/get state :data-limits {}))
        bound (+ 16 (* 8 (:bytes cost)) (* 8 (:nodes cost)))]
   ;; Covers binary escaping/invalid UTF-8, decimal integer digits, keyword and
   ;; container punctuation conservatively BEFORE any output allocation.
@@ -6060,7 +6095,9 @@
        (and (map? value) (not (contains? value :__struct__)))
         (Enum/map (Map/to_list value) (fn [pair] [(elem pair 0) (elem pair 1)]))
        :else (constructor_refuse :opaque-sequence)))
-(defn- constructor_eager_sequence_bound! [value state]
+(defn- constructor_eager_sequence_bound!
+ ([value state] (constructor_eager_sequence_bound! value state true))
+ ([value state materialize?]
  ;; Rt's eager paths can materialize graphemes/map entries. Bound their input
  ;; BEFORE calling the runtime; approved Vector/Set storage was already checked
  ;; by the shared raw-data gate. Deferred/foreign structs never reach this point.
@@ -6073,12 +6110,13 @@
                   (erlang/is_map value) (erlang/map_size value)
                   :else 0)]
   (when (> size (:max-collection state)) (constructor_refuse :collection-budget))
+  (when materialize?
   (cond
    (erlang/is_binary value) (constructor_allocation! (* 4 size) size state)
    (or (erlang/is_tuple value) (vector? value) (set? value))
     (constructor_allocation! (* 2 size) 0 state)
    (erlang/is_map value) (constructor_allocation! (* 16 size) 0 state)
-   :else nil)))
+   :else nil)))))
 (defn- constructor_eager_last [value]
  (loop [remaining value]
   (let [tail (BeamLisp.Ns.Rt/next remaining)]
@@ -6280,8 +6318,12 @@
   (when (and (= module :Elixir.BeamLisp.Ns.Core)
              (contains? #{"first" "second" "rest" "next" "last" "nth" "count" "empty?"
                           "seq" "take" "drop" "to-list" "vec"} primitive-name))
-   (Enum/each args (fn [value] (constructor_eager_sequence_bound! value state)))
-   (constructor_charge! args state))
+   ;; Reading an existing tree does not allocate that tree again. Retain
+   ;; sequence/materialization bounds and raw walk fuel, but do not spend the
+   ;; allocation quota on every borrowed suffix in a recursive syntax walk.
+   (Enum/each args (fn [value]
+                    (constructor_eager_sequence_bound! value state
+                      (not (contains? #{"count" "empty?"} primitive-name))))))
   (when (and (= module :Elixir.BeamLisp.Ns.Core)
              (contains? #{"concat" "map" "mapv" "mapcat" "vec" "vector" "list" "into"
                           "assoc" "dissoc" "conj" "hash-map" "merge" "set" "str" "join"}
@@ -6371,7 +6413,7 @@
      "conj" (apply conj args) "hash-map" (apply hash-map args)
      "merge" (Enum/reduce args nil (fn [item acc]
                 (if (nil? item) acc (Map/merge (or acc {}) item))))
-     "str" (do (BeamLisp.CompilerData/check_first_order! args) (apply str args))
+     "str" (do (BeamLisp.CompilerData/check_first_order! args (Map/get state :data-limits {})) (apply str args))
      "name" (name (first args)) "symbol" (apply symbol args) "keyword" (constructor_keyword! args state)
      "fn?" (or (erlang/is_function (first args))
                 (and (erlang/is_tuple (first args)) (= 3 (erlang/tuple_size (first args)))
@@ -6521,7 +6563,7 @@
       (constructor_invoke (first args) (erlang/++ leading trailing) state)))
    (= target [:binary :split 2])
     (do
-     (BeamLisp.CompilerData/check_first_order! args)
+     (BeamLisp.CompilerData/check_first_order! args (Map/get state :data-limits {}))
      (when-not (and (erlang/is_binary (first args))
                     (or (erlang/is_binary (second args))
                         (and (erlang/is_list (second args))
@@ -6536,17 +6578,17 @@
                  [:Elixir.BeamLisp.Record :record? 1]} target)
     ;; These exact predicates inspect raw shapes/registered identity only.
     ;; Private recipes/callables and foreign/native values never cross here.
-    (do (BeamLisp.CompilerData/check_first_order! (first args))
+    (do (BeamLisp.CompilerData/check_first_order! (first args) (Map/get state :data-limits {}))
         (erlang/apply module function args))
    (= target [:Elixir.Map :delete 2])
     (do
-     (BeamLisp.CompilerData/check_first_order! args)
+     (BeamLisp.CompilerData/check_first_order! args (Map/get state :data-limits {}))
      (when-not (and (erlang/is_map (first args))
                     (not (maps/is_key :__struct__ (first args))))
       (constructor_refuse :plain-map-delete-domain))
      (Map/delete (first args) (second args)))
    (= target [:Elixir.BeamLisp.Ns.Rt :transientable? 1])
-    (do (BeamLisp.CompilerData/check_first_order! (first args))
+    (do (BeamLisp.CompilerData/check_first_order! (first args) (Map/get state :data-limits {}))
         (BeamLisp.Ns.Rt/transientable? (first args)))
    (= target [:Elixir.BeamLisp.Ns.Rt :print_readably 1])
     (constructor_readable! (first args) state)
@@ -6605,7 +6647,7 @@
  (try
  (let [value
   (case (:op n)
-   :lit (do (BeamLisp.CompilerData/check_first_order! (:val n)) (:val n))
+   :lit (do (BeamLisp.CompilerData/check_first_order! (:val n) (Map/get state :data-limits {})) (:val n))
    :var (if (contains? env (:name n)) (get env (:name n)) (constructor_refuse :unbound-local))
    :global (let [key [(:ns n) (:name n)]
                  alias (when-not (= :exact (:lookup n)) (get (:global-aliases state) key))
@@ -6715,14 +6757,15 @@
 
 (defn interpret_constructor!
  [expression locals metadata]
- (BeamLisp.CompilerData/check_first_order! locals)
- (let [key (tuple :constructor-machine-frame (erlang/make_ref))
-       state (Map/merge metadata {:counter-frame key :max-collection 16384})]
+ (let [limits (constructor_data_limits)
+       _ (BeamLisp.CompilerData/check_first_order! locals limits)
+       key (tuple :constructor-machine-frame (erlang/make_ref))
+       state (Map/merge metadata {:counter-frame key :max-collection 16384 :data-limits limits})]
   (erlang/put key {:remaining 1000000 :walk-steps 16000000 :depth 0 :allocation-nodes 1000000 :allocation-bytes 16777216 :new-atoms 64 :fresh-symbols 4096 :recipe-serial 0 :recipe-depth 0 :recipes {} :callables {}})
   (try
    (let [result (constructor_interpret expression locals state)]
     (when (constructor_recipe_present! result state) (constructor_refuse :finite-recipe-escape))
-    (BeamLisp.CompilerData/check_first_order! result) result)
+    (BeamLisp.CompilerData/check_first_order! result (Map/get state :data-limits {})) result)
    (catch error
     (erlang/raise __EXCEPTION_KIND__ (constructor_diagnostic_error error nil) __STACKTRACE__))
    (finally (erlang/erase key)))))
@@ -6773,7 +6816,7 @@
  ([definitions values namespace binding arguments]
   (constructor_call! definitions values {} namespace binding arguments))
  ([definitions values aliases namespace binding arguments]
- (BeamLisp.CompilerData/check_first_order! arguments)
+ (BeamLisp.CompilerData/check_first_order! arguments (constructor_data_limits))
  (interpret_constructor! {:op :apply :fn {:op :global :ns namespace :name binding}
         :args (Enum/map (BeamLisp.Ns.Rt/k-to-list arguments)
                 (fn [value] {:op :lit :val value}))}
@@ -6893,7 +6936,10 @@
       (BeamLisp.Env/add_core_excludes namespace (list))
       (doseq [pair (Map/get (:metadata header) :aliases)]
        (BeamLisp.Env/add_alias namespace (elem pair 0) (elem pair 1)))
-      (doseq [target (:requires header)] (constructor_unit! target))
+      ;; Requires describe resolution, not a metadata execution schedule.
+      ;; Staged macro/source lookup selects and prelinks the actual callee
+      ;; before compilation uses it. Recursively preparing every require here
+      ;; reparsed the whole SDK closure for EACH unit's constructor context.
       (doseq [pair (Map/get (:metadata header) :refers)]
        (BeamLisp.Env/add_refer namespace (elem pair 0) (elem pair 1)))
       (doseq [target (Map/get (:metadata header) :refer_alls)]
