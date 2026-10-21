@@ -16,11 +16,11 @@
   (rel/text (erlang/apply :os :getpid (list))))
 
 (defn read-claim
-  "The claim at `dir` as `{:pid :at :bin}`, or nil when there is none (or it is
+  "The claim at `dir` as `{:pid :at :bin :token?}`, or nil when there is none (or it is
    unreadable — an unreadable claim is no claim).
 
    A claim file is ONE FACT, space-separated, the same idiom as the build log and
-   the lock: `[:claim <pid> <at-ms> <what>]`. The first version wrote a map with
+   the lock: `[:claim-v2 <pid> <at-ms> <cohort> <what>]` (legacy claims still read). The first version wrote a map with
    `pr-str` and read it back with `read-string` — and bl's reader answers NODES,
    not values, so the map test failed, every claim read as nil, and the exclusion
    silently did nothing. The suite caught it: a claim written by another process
@@ -29,9 +29,14 @@
   (let [r (File/read (path-for dir))]
     (when (= :ok (elem r 0))
       (let [parts (String/split (String/trim (elem r 1)) " ")]
-        (when (and (= "[:claim" (first parts)) (>= (count parts) 4))
+        (cond
+          (and (= "[:claim-v2" (first parts)) (>= (count parts) 5))
+          {:pid (nth parts 1) :at (nth parts 2) :token (nth parts 3)
+           :bin (String/trim_trailing (Enum/join (Enum/drop parts 4) " ") "]")}
+          (and (= "[:claim" (first parts)) (>= (count parts) 4))
           {:pid (nth parts 1) :at (nth parts 2)
-           :bin (String/trim_trailing (Enum/join (Enum/drop parts 3) " ") "]")})))))
+           :bin (String/trim_trailing (Enum/join (Enum/drop parts 3) " ") "]")}
+          :else nil)))))
 
 (defn alive?
   "Whether the process that wrote `c` is still running. Linux answers with
@@ -51,45 +56,77 @@
 
 (defn owned? [dir] (some? (Process/get (handle-key dir))))
 
-(defn- lock! [dir]
+(defn- lock-anchor [dir]
   (File/mkdir_p! dir)
   (let [physical (workspace-path dir) base (Path/basename physical)
-        anchors (if (= base ".bl") ".bl-locks" ".bl")
-        path (Path/join (Path/join (Path/join (Path/dirname physical) anchors) "locks") base)]
-    (BeamLisp.LazyMemo/ensure_loaded!)
-    (BeamLisp.LazyMemo/nif_file_lock path false true)))
+        anchors (if (= base ".bl") ".bl-locks" ".bl")]
+    (Path/join (Path/join (Path/join (Path/dirname physical) anchors) "locks") base)))
+
+(defn- lock! [dir]
+  (BeamLisp.LazyMemo/ensure_loaded!)
+  (BeamLisp.LazyMemo/nif_file_lock (lock-anchor dir) false true))
+(defn- followers-lock! [dir shared]
+  (BeamLisp.LazyMemo/ensure_loaded!)
+  (BeamLisp.LazyMemo/nif_file_lock (str (lock-anchor dir) ".followers") shared true))
+(defn- holder [dir]
+  (or (read-claim dir) {:pid "unknown" :at "unknown" :bin "build"}))
 
 (defn held-by
-  "Observe kernel custody. The readable claim is diagnostic, never authority.
-   Only this BEAM process's own handle is reentrant."
+  "Observe writer and child custody. Only this process's writer is reentrant."
   [dir]
-  (if (Process/get (handle-key dir))
-    nil
+  (if (owned? dir) nil
     (let [r (lock! dir)]
-      (if (= :ok (elem r 0))
-        (do (BeamLisp.LazyMemo/nif_file_unlock (elem r 1)) nil)
-        (or (read-claim dir) {:pid "unknown" :at "unknown" :bin "build"})))))
+      (if (not= :ok (elem r 0)) (holder dir)
+        (try
+          (let [followers (followers-lock! dir false)]
+            (if (= :ok (elem followers 0))
+              (do (BeamLisp.LazyMemo/nif_file_unlock (elem followers 1)) nil)
+              (assoc (holder dir) :custody :child)))
+          (finally (BeamLisp.LazyMemo/nif_file_unlock (elem r 1))))))))
 
 (defn acquire!
-  "Atomically claim a workspace. Kernel ownership releases on owner/VM death;
-   the claim file names the owner for diagnostics. Never unlink the lock anchor."
+  "Take writer custody, then exclude any child of an earlier writer before
+   publishing a new cohort token. A parent crash cannot authorize restaging
+   while its compiler child is still using the workspace."
   [dir what]
-  (if (Process/get (handle-key dir))
-    {:ok? true :swept false :held nil}
+  (if (owned? dir) {:ok? true :swept false :held nil}
     (let [r (lock! dir)]
       (if (not= :ok (elem r 0))
-        {:ok? false :swept false :held (or (read-claim dir)
-                                          {:pid "unknown" :at "unknown" :bin "build"})}
-        (let [handle (elem r 1) prior (read-claim dir)]
+        {:ok? false :swept false :held (holder dir)}
+        (let [handle (elem r 1)]
           (try
-            (File/mkdir_p! dir)
-            (File/write! (path-for dir)
-              (str "[:claim " (owner-pid) " " (erlang/system_time :millisecond) " " what "]"))
-            (Process/put (handle-key dir) handle)
-            {:ok? true :swept (some? prior) :held nil}
-            (catch e
-              (BeamLisp.LazyMemo/nif_file_unlock handle)
-              (throw e))))))))
+            (let [followers (followers-lock! dir false)]
+              (if (not= :ok (elem followers 0))
+                (do (BeamLisp.LazyMemo/nif_file_unlock handle)
+                    {:ok? false :swept false :held (assoc (holder dir) :custody :child)})
+                (try
+                  (let [prior (read-claim dir)
+                        token (Base/encode16 (crypto/strong_rand_bytes 16) (list (tuple :case :lower)))]
+                    (File/write! (path-for dir)
+                      (str "[:claim-v2 " (owner-pid) " " (erlang/system_time :millisecond)
+                           " " token " " what "]"))
+                    (Process/put (handle-key dir) handle)
+                    {:ok? true :swept (some? prior) :held nil})
+                  (finally (BeamLisp.LazyMemo/nif_file_unlock (elem followers 1))))))
+            (catch e (BeamLisp.LazyMemo/nif_file_unlock handle) (throw e))))))))
+
+(defn follower-context
+  "Exact parent claim for a child. Compare it AFTER taking shared child custody;
+   a child starting after a replacement writer's claim must refuse before work."
+  [dir]
+  (when-not (owned? dir) (throw (ex-info "Workspace claim required" {:kind :workspace-unclaimed})))
+  (tuple (str (lock-anchor dir) ".followers") (Path/expand (path-for dir)) (File/read! (path-for dir))))
+
+(defn with-follower [context action]
+  (BeamLisp.LazyMemo/ensure_loaded!)
+  (let [r (BeamLisp.LazyMemo/nif_file_lock (elem context 0) true true)]
+    (when-not (= :ok (elem r 0))
+      (throw (ex-info "Workspace custody changed" {:kind :stale-workspace-claim})))
+    (try
+      (when-not (= (tuple :ok (elem context 2)) (File/read (elem context 1)))
+        (throw (ex-info "Workspace custody changed" {:kind :stale-workspace-claim})))
+      (action)
+      (finally (BeamLisp.LazyMemo/nif_file_unlock (elem r 1))))))
 
 (defn clear!
   "Empty `dir` and keep it, and keep the claim on it. A build that rewrites a
