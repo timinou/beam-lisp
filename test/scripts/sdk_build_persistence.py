@@ -55,7 +55,7 @@ BeamLisp.AOT.compile_host_file(pinned, module: BeamLisp.BuildProofHost, output_d
 if BeamLisp.BuildProofHost.value() != 7, do: raise("pinned declaration compilation failed")
 # Build the actual edited driver under private namespace names, preserving
 # the compiler identity/source snapshot of the SDK used to run this probe.
-for leaf <- ["build-log.bl", "build.bl"] do
+for leaf <- ["build-plan.bl", "build-log.bl", "build.bl"] do
   src = Path.join(work, leaf)
   BeamLisp.AOT.compile_file(src, output_dir: Path.join(work, "driver"), mark_loaded?: true)
 end
@@ -66,7 +66,7 @@ if phase == "first" do
   # false rather than nil, especially for units containing arbitrary effects.
   false = BeamLisp.AOT.replayable_cached_source?("sdkbuild-effects", Path.join(work, "sources/sdkbuild-effects.bl"))
 end
-patterns = %{compilations: {BeamLisp.AOT, :compile_file, 2},
+patterns = %{build_parses: {BeamLisp.BuildPlan, :"build-content-parts", 1}, compilations: {BeamLisp.AOT, :compile_file, 2},
              source_initializations: {BeamLisp.AOT, :load_unit, 2},
              artifact_restorations: {BeamLisp.AOTCache, :restore_prepared, 2},
              artifact_preparations: {BeamLisp.AOTCache, :prepare_fetch, 2},
@@ -164,7 +164,7 @@ metrics = Map.merge(metrics, %{assembled_units: map_size(r.manifest), initialize
 IO.puts("SDK-BUILD-PROBE " <> Jason.encode!(metrics))
 if Enum.any?(r.errors), do: raise(inspect(r.errors))
 if phase == "unchanged" do
-  if metrics.compilations != 0 or metrics.initializer_executions != 0 or r.built != 0,
+  if metrics.compilations != 0 or metrics.initializer_executions != 0 or metrics.build_parses != 0 or r.built != 0,
     do: raise("unchanged build performed executable work")
   for ns <- ["sdkbuild-base", "sdkbuild-custom", "sdkbuild-macros", "sdkbuild-consumer", "sdkbuild-effects", "sdkbuild-macro-effects"] do
     if BeamLisp.Env.loaded_ns?(ns), do: raise("packaging initialized #{ns}")
@@ -206,8 +206,10 @@ def main():
             raise SystemExit('probe work directory must be empty')
         sources = work / 'sources'
         sources.mkdir()
-        for leaf in ('build-log.bl', 'build.bl'):
+        for leaf in ('build-plan.bl', 'build-log.bl', 'build.bl'):
             source = (ROOT / 'priv/build' / leaf).read_text()
+            source = source.replace('(ns build-plan\n', '(ns sdk-build-plan\n')
+            source = source.replace('[build-plan :as plan]', '[sdk-build-plan :as plan]')
             source = source.replace('(ns build-log)', '(ns sdk-build-log)')
             source = source.replace('(ns build\n', '(ns sdk-build-driver\n')
             source = source.replace('[build-log :as blog]', '[sdk-build-log :as blog]')
