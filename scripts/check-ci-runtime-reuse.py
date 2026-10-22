@@ -13,7 +13,7 @@ import subprocess
 NON_RUNTIME_PREFIXES = ('test/', 'docs/', 'reports/')
 NON_RUNTIME_FILES = frozenset((
     'README.md', 'AGENTS.md', '.github/workflows/ci.yml', 'scripts/qualify-candidate.py',
-    'scripts/qualify-candidate.bl', 'scripts/ci-test-shard.py',
+    'scripts/qualify-candidate.bl', 'scripts/qualify-self-build.py', 'scripts/ci-test-shard.py',
     'scripts/test-isolation.json', 'scripts/test-durations.json',
     'scripts/check-ci-runtime-reuse.py', 'scripts/wait-ci-producer.py', 'scripts/bl-mem',
 ))
