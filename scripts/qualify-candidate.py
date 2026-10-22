@@ -36,9 +36,22 @@ def completed(path, identity):
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue  # A power interruption can leave one incomplete last receipt.
-            if row.get("identity") == identity:
+            if row.get("identity") == identity and "file" in row:
                 rows[row["file"]] = row
     return rows
+
+
+def batch_status(path, identity):
+    status = -1
+    if path.exists():
+        for line in path.read_text().splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("identity") == identity and row.get("type") == "batch":
+                status = row["process_status"]
+    return status
 
 
 def stop_children(runtime):
@@ -79,6 +92,7 @@ def main():
     files = list(dict.fromkeys(args.files))
     pending = [name for name in files if name not in prior]
     args.results.parent.mkdir(parents=True, exist_ok=True)
+    status = batch_status(args.results, identity) if args.resume else -1
     if pending:
         env = dict(os.environ, BL_QUALIFY_FILES="\n".join(pending),
                    BL_QUALIFY_TIMEOUT_MS=str(args.timeout * 1000), BL_TEST_SOURCE_ROOT=str(ROOT),
@@ -107,6 +121,10 @@ def main():
                             receipts.flush()
                             os.fsync(receipts.fileno())
                     status = process.wait()
+                    receipts.write(json.dumps({"type": "batch", "identity": identity,
+                                               "process_status": status}) + "\n")
+                    receipts.flush()
+                    os.fsync(receipts.fileno())
                 finally:
                     if process.poll() is None:
                         process.terminate()
@@ -120,8 +138,8 @@ def main():
     changed = source_digest(ROOT) != identity["source"] or digest(candidate) != identity["candidate"]
     print(json.dumps({"candidate": identity["candidate"], "files": len(files),
                       "completed": len(files) - len(missing), "failed": failed, "missing": missing,
-                      "inputs_changed": changed}, indent=2))
-    return int(bool(missing or failed or changed))
+                      "inputs_changed": changed, "process_status": status}, indent=2))
+    return int(bool(missing or failed or changed or status != 0))
 
 
 if __name__ == "__main__":

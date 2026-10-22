@@ -24,3 +24,14 @@ class Receipts(unittest.TestCase):
             found = RUNNER.completed(path, identity)
             self.assertEqual(["b.bl"], list(found))
             self.assertEqual(1, found["b.bl"]["fail"])
+
+    def test_successful_files_do_not_hide_a_failed_worker_or_missing_batch_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.jsonl"
+            identity = {"candidate": "new", "source": "current"}
+            path.write_text(json.dumps({"file": "a.bl", "identity": identity, "fail": 0}) + "\n")
+            self.assertEqual(-1, RUNNER.batch_status(path, identity))
+            with path.open("a") as out:
+                out.write(json.dumps({"type": "batch", "identity": identity, "process_status": 70}) + "\n")
+            self.assertEqual(70, RUNNER.batch_status(path, identity))
+            self.assertEqual(["a.bl"], list(RUNNER.completed(path, identity)))
