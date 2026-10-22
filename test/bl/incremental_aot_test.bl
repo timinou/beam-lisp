@@ -25,39 +25,12 @@
 ;                                run must rebuild only the edited leaf
 ;   repair + reuse               the production loader, plus two child VMs
 ;
-; ── Running it against a checkout whose host source is newer than the floor ──
-;
-; `AOT.ensure_loaded/1` is a PINNED HOST module (`priv/host/aot.bl`). A checkout
-; that has edited that source but has not regenerated `build/` and
-; `priv/bootstrap/seed/` yet still RUNS the old host, so the repair half of this
-; file cannot pass there. Two environment variables let the file be exercised
-; against current source in exactly that state; both are no-ops on a coherent
-; image, where they are left unset:
-;
-;   BL_AOT_TEST_KEY=<hex>  pin `AOTCache.compiler_key/0` for every VM the test
-;                          starts, so the boot tier in `build/` is trusted even
-;                          though the live codegen digest has moved. Set it to
-;                          the key the INSTALLED image was built with.
-;   BL_AOT_TEST_HOST=1     the CHILD VMs reload `priv/host/aot.bl` into
-;                          `Elixir.BeamLisp.AOT` before they ask anything. The
-;                          parent half needs the same reload, which only a
-;                          harness can do (see below) — a BL test cannot replace
-;                          the module it is running under.
-;
-; Recipe (checkout with an edited `priv/host/aot.bl`, before `bl build && bl
-; seed`). `KEY` is the key the installed image was built with:
-;
-;   KEY=$(elixir -pa build -e 'Code.ensure_loaded(BeamLisp.AOTCache); IO.write(BeamLisp.AOTCache.compiler_key())')
-;   BL_AOT_TEST_KEY=$KEY BL_AOT_TEST_HOST=1 bl test test/bl/incremental_aot_test.bl
-;   …where the harness reloads the host in the parent first, i.e.
-;   `BeamLisp.AOT.compile_host_file("priv/host/aot.bl",
-;      [module: BeamLisp.AOT, output_dir: tmp, load?: true])`.
-;
-; On a coherent image (`bl build && bl seed` has run): plain
-; `bl test test/bl/incremental_aot_test.bl`.
+; The candidate and every child use one selected SDK image. Compiler keys and
+; host modules are never overridden by the fixture. Builds use scoped compiler
+; state so a compile cannot silently mark the caller's runtime namespace ready.
 
 (ns incremental-aot.test
-  (:require [build :as b] [build-plan :as bp]))
+  (:require [build :as b] [build-plan :as bp] [env]))
 
 ; ── the fixture tree ────────────────────────────────────────────────────────
 
@@ -169,10 +142,13 @@
    clean, or every source would look fresh-less and rebuild."
   [clean? paths]
   (when clean? (b/clean out-dir manifest-path))
-  (BeamLisp.Env/add_search_path src-dir)
-  (try
-    (b/run {:sources paths :out out-dir :manifest manifest-path :jobs 1})
-    (finally (BeamLisp.Env/remove_search_path src-dir))))
+  (let [builder (env/fork)]
+   (try
+    (env/with-env builder
+     (fn []
+      (BeamLisp.Env/add_search_path src-dir)
+      (b/run {:sources paths :out out-dir :manifest manifest-path :jobs 1 :scope :scoped})))
+    (finally (env/destroy builder)))))
 
 (deftest a-body-edit-rebuilds-the-leaf-and-reuses-the-consumer
   (fresh!)
@@ -298,22 +274,22 @@
 ; the live closure key, and a later VM links that entry instead of reading
 ; source.
 ;
-; The fixture carries TWO observable effects, and the split IS the proof: a BARE
-; top-level form runs only when the source is EVALUATED (the compile path),
-; while a `def` initializer ALSO replays through `__bl_init__/0` (the link
-; path). So `bare = 1` for the rest of the run is "source evaluated exactly
-; once", and `init` counting up by one per VM is the link path doing its job.
+; A defining macro records source compilation, while a value initializer
+; records per-VM initialization. Bare top-level actions deliberately have no
+; complete replay witness and are unsuitable cache-hit fixtures. Native compiler
+; call counts independently confirm that the second VM links without compiling.
 
 (defn- rep-source
-  "The repair fixture at `version`: a bare effect and a `def` effect, each
-   appending to `marks/`."
+  "A defining macro records compilation; a value initializer records replay.
+   Every top-level form has an actual complete replay witness."
   [version added?]
-  (let [bare "(erlang/apply :file :write_file (list (Path/join (System/get_env \"REP_MARK\") \"bare.log\") \"x\\n\" (list :append)))"
+  (let [stamp "(erlang/apply :file :write_file (list (Path/join (System/get_env \"REP_MARK\") \"bare.log\") \"x\\n\" (list :append)))"
         init "(def marker (erlang/apply :file :write_file (list (Path/join (System/get_env \"REP_MARK\") \"init.log\") \"x\\n\" (list :append))))"]
     (str "(ns inc.rep)\n"
-         "(defn probe [] " version ")\n"
+         "(defmacro stamp-probe [] (do " stamp " (list 'defn 'probe [] " version ")))\n"
+         "(stamp-probe)\n"
          (if added? "(defn added [] :new)\n" "")
-         bare "\n" init "\n")))
+         init "\n")))
 
 (defn- bare-count [] (lines (Path/join mark-dir "bare.log")))
 (defn- init-count [] (lines (Path/join mark-dir "init.log")))
@@ -368,29 +344,18 @@
 ; ── 6. a fresh child reuses the published artifact ──────────────────────────
 
 (defn- child-script
-  "The child program: boot the language, honour the two current-source variables,
-   then load the fixture through the PRODUCTION AOT repair boundary, and print what happened."
+  "Use the selected artifact's coherent boot and real production repair gate."
   []
   (str "Code.append_path(" (pr-str out-dir) ")\n"
-       "IO.puts(\"env_key=\" <> inspect(System.get_env(\"BL_AOT_TEST_KEY\")))\n"
-       "case System.get_env(\"BL_AOT_TEST_KEY\") do\n"
-       "  nil -> :ok\n"
-       "  key -> :persistent_term.put({BeamLisp.AOTCache, :toolchain_key}, key)\n"
-       "end\n"
        "Application.load(:beam_lisp)\n"
-       "{:ok, _} = BeamLisp.Env.start_link([])\n"
-       "{:ok, _} = BeamLisp.Loader.Server.start_link([])\n"
-       "IO.puts(\"key=\" <> inspect(BeamLisp.AOTCache.compiler_key()))\n"
-       "BeamLisp.init()\n"
-       "if System.get_env(\"BL_AOT_TEST_HOST\") == \"1\" do\n"
-       "  dir = Path.join(System.tmp_dir!(), \"bl_aot_test_host\")\n"
-       "  File.mkdir_p!(dir)\n"
-       "  BeamLisp.AOT.compile_host_file(\"priv/host/aot.bl\",\n"
-       "    [module: BeamLisp.AOT, output_dir: dir, load?: true])\n"
-       "end\n"
+       "for app <- Application.spec(:beam_lisp, :applications) || [], do: {:ok, _} = Application.ensure_all_started(app)\n"
+       "BeamLisp.AOT.boot()\n"
+       "BeamLisp.Loader.ensure_loaded(\"build-plan\")\n"
+       ":erlang.trace_pattern({BeamLisp.AOT, :compile_source, 2}, true, [:local, :call_count])\n"
        "r = BeamLisp.Loader.with_ambient_dirs([" (pr-str src-dir) "],\n"
        "      fn -> BeamLisp.AOT.ensure_loaded(\"inc.rep\") end)\n"
        "IO.puts(\"load=\" <> inspect(r))\n"
+       "IO.puts(\"compiles=\" <> inspect(:erlang.trace_info({BeamLisp.AOT, :compile_source, 2}, :call_count)))\n"
        "IO.puts(\"probe=\" <> inspect(BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!(\"inc.rep\", \"probe\"), [])))\n"
        "IO.puts(\"added=\" <> inspect(BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!(\"inc.rep\", \"added\"), [])))\n"
        "marks = fn p -> case File.read(p) do {:ok, s} -> length(String.split(s, \"\\n\", trim: true)); _ -> 0 end end\n"
@@ -398,20 +363,17 @@
        "IO.puts(\"init=\" <> inspect(marks.(" (pr-str (Path/join mark-dir "init.log")) ")))\n"))
 
 (defn- run-child!
-  "Run one child VM; returns its merged output. Every expected key must be in it."
+  "A fresh VM with all dependencies from the exact selected SDK and no checkout cwd."
   []
-  (let [code-dir (Path/dirname
-                   (erlang/list_to_binary
-                     (code/which (erlang/binary_to_atom "Elixir.BeamLisp" :utf8))))
-        r (System/cmd "elixir"
-              (to-list ["-pa" code-dir "-pa" out-dir "-e" (child-script)])
-              (to-list [(tuple :stderr_to_stdout true)
-                        (tuple :env
-                          (to-list [(tuple "BEAM_LISP_PATH" src-dir)
-                                    (tuple "REP_MARK" mark-dir)
-                                    (tuple "BEAM_LISP_AOT_CACHE_DIR" cache-dir)
-                                    (tuple "BL_AOT_TEST_KEY" (or (System/get_env "BL_AOT_TEST_KEY") ""))
-                                    (tuple "BL_AOT_TEST_HOST" (or (System/get_env "BL_AOT_TEST_HOST") ""))]))]))]
+  (let [app (Path/dirname (Path/dirname (erlang/list_to_binary (code/which :Elixir.BeamLisp))))
+        paths (Path/wildcard (Path/join (Path/dirname app) "*/ebin"))
+        args (to-list (concat (mapcat (fn [path] ["-pa" path]) paths)
+                             ["-pa" out-dir "-e" (child-script)]))
+        r (System/cmd "elixir" args
+              (list (tuple :stderr_to_stdout true) (tuple :cd tmp)
+                    (tuple :env (list (tuple "BL_ROOT" app) (tuple "BL_DAEMON" "off")
+                                      (tuple "BEAM_LISP_PATH" nil) (tuple "REP_MARK" mark-dir)
+                                      (tuple "BEAM_LISP_AOT_CACHE_DIR" cache-dir)))))]
     (is (= 0 (elem r 1)) (str "child VM exited " (elem r 1) ":\n" (elem r 0)))
     (elem r 0)))
 
@@ -430,14 +392,16 @@
       (is (includes? text "probe=:v2") text)
       (is (includes? text "added=:new") text)
       (is (includes? text "bare=1") text)
-      (is (includes? text "init=1") text))
+      (is (includes? text "init=1") text)
+      (is (includes? text "compiles={:call_count, 1}") text))
     ; child 2: a cache HIT — linked and replayed, source untouched
     (let [text (run-child!)]
       (is (includes? text "load=:loaded") text)
       (is (includes? text "probe=:v2") text)
-      (is (includes? text "bare=1")
-          (str "child 2 must NOT evaluate the source; got:\n" text))
-      (is (includes? text "init=2") (str "child 2 must replay the initializer; got:\n" text)))
+      (is (includes? text "bare=1") (str "the defining macro must not execute on an artifact hit:\n" text))
+      (is (includes? text "init=2") (str "child 2 must replay the initializer; got:\n" text))
+      (is (includes? text "compiles={:call_count, 0}")
+          (str "the second VM must link the published artifact without source compilation:\n" text)))
     (finally
       (System/delete_env "BEAM_LISP_AOT_CACHE_DIR")
       (cleanup!))))
