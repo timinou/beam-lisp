@@ -133,7 +133,10 @@ def main():
                 reported, handover = set(), False
                 # Each process owns its endpoint directory. Lifetime handovers and
                 # privileged fixtures stay serial inside the caller's tree cap.
-                with tempfile.TemporaryDirectory(prefix="bl-qualify-") as runtime:
+                # Preserve the host's runtime-filesystem contract as well as
+                # endpoint isolation (health publishers reject /tmp sockets).
+                with tempfile.TemporaryDirectory(prefix="bl-qualify-",
+                        dir=os.environ.get("XDG_RUNTIME_DIR")) as runtime:
                     env["XDG_RUNTIME_DIR"] = runtime
                     command = [str(candidate), "--cold", "run", str(ROOT / "scripts/qualify-candidate.bl")]
                     process = subprocess.Popen(command, cwd=ROOT, env=env, text=True,

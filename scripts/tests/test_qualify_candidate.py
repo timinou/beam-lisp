@@ -2,6 +2,7 @@ import importlib.util
 import json
 import contextlib
 import io
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -22,6 +23,8 @@ class Receipts(unittest.TestCase):
             candidate = root / "candidate"
             candidate.write_text("#!/usr/bin/env python3\n" + f"fail_first = {fail_first!r}\n" + '''
 import json, os
+from pathlib import Path
+assert Path(os.environ['XDG_RUNTIME_DIR']).parent == Path(os.environ['EXPECTED_RUNTIME_PARENT'])
 files = os.environ['BL_QUALIFY_FILES'].splitlines()
 report = files if fail_first else files[:1]
 for name in report:
@@ -35,7 +38,8 @@ raise SystemExit(70 if fail_first and len(files) > 1 else 0)
             argv = ["qualify", "--candidate", str(candidate), "--results", str(results),
                     "a.bl", "b.bl", "fault.bl"]
             with patch.object(RUNNER, "ROOT", root), patch.object(RUNNER, "source_digest", return_value="source"), \
-                    patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+                    patch.object(sys, "argv", argv), patch.dict(os.environ, {"XDG_RUNTIME_DIR": directory,
+                    "EXPECTED_RUNTIME_PARENT": directory}), contextlib.redirect_stdout(io.StringIO()):
                 status = RUNNER.main()
             return status, [json.loads(line) for line in results.read_text().splitlines()]
 
