@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import statistics
 import subprocess
 import tempfile
@@ -70,6 +71,17 @@ with tempfile.TemporaryDirectory(prefix='bl-drop-startup-', dir=temporary_parent
         elapsed, _ = run([str(artifact), '--cold', 'run', str(hello)], directory, env)
         cold_vm_times.append(round(elapsed, 3))
         print(f'cold-vm-{sample + 1}: {elapsed:.3f}s', flush=True)
+
+    # A source checkout in the caller's cwd must not become this installed
+    # runtime's compiler. Shadow all host inputs and edit one byte without
+    # changing the selected executable, its environment, or its shipped files.
+    shadow = directory / 'foreign-checkout'
+    source_hosts = Path(__file__).resolve().parents[2] / 'priv/host'
+    shutil.copytree(source_hosts, shadow / 'priv/host')
+    host = shadow / 'priv/host/server.bl'
+    host.write_bytes(host.read_bytes() + b'\n; foreign checkout compiler input\n')
+    elapsed, _ = run([str(artifact), '--cold', 'eval', '(println (+ 40 2))'], shadow, env)
+    print(f'foreign-checkout-startup: {elapsed:.3f}s', flush=True)
 
     # Instrument the extracted image before the actual release entry starts
     # the app. Counting calls avoids a trace mailbox and its timing overhead.
