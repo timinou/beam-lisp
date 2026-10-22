@@ -22,7 +22,21 @@ receive do
   {:DOWN, ^ref, :process, ^pid, :normal} -> :ok
   after 3000 -> raise "legacy owned monitor changed its delivery shape"
 end
-IO.puts("PASS: owned tagged and legacy monitor delivery")
+scope=BeamLisp.Env.fork()
+token=BeamLisp.Env.with_env(scope,fn -> BeamLisp.Env.capture_native_context!() end)
+true=token==BeamLisp.Env.with_env(scope,fn -> BeamLisp.Env.capture_native_context!() end)
+^scope=BeamLisp.Env.resolve_native_context!(token)[:env]
+BeamLisp.Env.with_env(scope,fn ->
+ for n<-1..255, do: BeamLisp.Env.with_ns("native.context.#{n}",fn -> BeamLisp.Env.capture_native_context!() end)
+ try do BeamLisp.Env.with_ns("over-cap",fn -> BeamLisp.Env.capture_native_context!() end);raise "capacity accepted"
+ rescue e in ErlangError -> :native_context_capacity=e.original end
+end)
+true=Process.alive?(Process.whereis(BeamLisp.Env))
+BeamLisp.Env.destroy(scope)
+try do BeamLisp.Env.resolve_native_context!(token);raise "retired context accepted"
+rescue e in ErlangError -> :retired_native_context=e.original end
+IO.puts("PASS: owned monitors and bounded native context lifetime")
+
 '''
 
 
