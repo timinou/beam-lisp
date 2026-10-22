@@ -114,7 +114,7 @@ def main():
     if pending:
         env = dict(os.environ, BL_QUALIFY_FILES="\n".join(pending),
                    BL_QUALIFY_TIMEOUT_MS=str(args.timeout * 1000), BL_TEST_SOURCE_ROOT=str(ROOT),
-                   BL_DAEMON="off", BL_TEST_TIMES="1")
+                   BL_DAEMON="off", BL_TEST_TIMES="1", BL_QUALIFY_CANDIDATE=str(candidate))
         # Source inputs belong to tests; compiler/runtime inputs belong to the
         # selected artifact. A developer shell must not redirect the candidate
         # to checkout hosts, a source path, or a different installed release.
@@ -148,6 +148,12 @@ def main():
                                 row = json.loads(line.removeprefix("BL-QUALIFY "))
                                 if row.get("file") not in selected:
                                     raise RuntimeError("Candidate reported an unrequested test file")
+                                if (row["file"].endswith(("_test.bl", "_test.exs"))
+                                        and not any(row.get(key, 0) for key in ("tests", "pass", "fail", "error"))):
+                                    row.update(status="incoherent", error=1)
+                                    row.setdefault("details", []).append({
+                                        "test": "suite-discovery", "actual":
+                                        "No tests or assertions ran in this file's declared namespace"})
                                 reported.add(row["file"])
                                 row["identity"] = identity
                                 receipts.write(json.dumps(row, sort_keys=True) + "\n")

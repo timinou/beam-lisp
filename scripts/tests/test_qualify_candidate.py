@@ -15,7 +15,7 @@ SPEC.loader.exec_module(RUNNER)
 
 
 class Receipts(unittest.TestCase):
-    def run_process_control(self, fail_first=False):
+    def run_process_control(self, fail_first=False, empty_suite=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
@@ -25,6 +25,7 @@ class Receipts(unittest.TestCase):
 import json, os
 from pathlib import Path
 assert Path(os.environ['XDG_RUNTIME_DIR']).parent == Path(os.environ['EXPECTED_RUNTIME_PARENT'])
+assert Path(os.environ['BL_QUALIFY_CANDIDATE']).resolve() == Path(__file__).resolve()
 files = os.environ['BL_QUALIFY_FILES'].splitlines()
 report = files if fail_first else files[:1]
 for name in report:
@@ -36,7 +37,7 @@ raise SystemExit(70 if fail_first and len(files) > 1 else 0)
             candidate.chmod(0o755)
             results = root / "results.jsonl"
             argv = ["qualify", "--candidate", str(candidate), "--results", str(results),
-                    "a.bl", "b.bl", "fault.bl"]
+                    "empty_test.bl" if empty_suite else "a.bl", "b.bl", "fault.bl"]
             with patch.object(RUNNER, "ROOT", root), patch.object(RUNNER, "source_digest", return_value="source"), \
                     patch.object(sys, "argv", argv), patch.dict(os.environ, {"XDG_RUNTIME_DIR": directory,
                     "EXPECTED_RUNTIME_PARENT": directory}), contextlib.redirect_stdout(io.StringIO()):
@@ -50,6 +51,14 @@ raise SystemExit(70 if fail_first and len(files) > 1 else 0)
         self.assertEqual(3, sum(row.get("type") == "process" for row in rows))
         self.assertEqual(1, sum(row.get("type") == "handover" for row in rows))
         self.assertEqual(0, rows[-1]["process_status"])
+
+    def test_declared_test_file_with_no_discovered_tests_cannot_pass(self):
+        status, rows = self.run_process_control(empty_suite=True)
+        self.assertEqual(1, status)
+        row = next(row for row in rows if row.get("file") == "empty_test.bl")
+        self.assertEqual("incoherent", row["status"])
+        self.assertEqual(1, row["error"])
+        self.assertEqual("suite-discovery", row["details"][0]["test"])
 
     def test_later_success_cannot_hide_an_earlier_failed_process(self):
         status, rows = self.run_process_control(fail_first=True)
