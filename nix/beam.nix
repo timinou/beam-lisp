@@ -12,7 +12,7 @@ let
     installTargets = [ "install" ];
   });
   elixirBuilder = import (pkgs.path + "/pkgs/development/interpreters/elixir/generic-builder.nix") {
-    version = "1.20.2";
+    version = "1.20.4";
     hash = null;
     minimumOTPVersion = "27";
     maximumOTPVersion = "29";

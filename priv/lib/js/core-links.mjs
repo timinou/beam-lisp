@@ -2,3 +2,5 @@
 export const LINKS = [];
 
 export const REST_FNS = [];
+
+export const RETURN_CONSTRUCTOR_SHAPES = null;

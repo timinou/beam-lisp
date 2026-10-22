@@ -237,7 +237,14 @@
                  _ (validate_pinned_declarations! source file)
                  unit (load_unit source (Keyword/put opts :file file))
                  defined (elem unit 0)
-                 value_defs (elem unit 1)]
+                 ;; Pinned hosts emit native clauses and have no namespace
+                 ;; initializer. Forward declarations are compile-time scaffolding
+                 ;; here; ordinary namespace emission retains their guarded replay.
+                 value_defs (Map/new (Enum/map (Map/to_list (elem unit 1))
+                              (fn [entry] (tuple (elem entry 0)
+                                (Enum/reject (elem entry 1)
+                                  (fn [value] (and (erlang/== 5 (erlang/tuple_size value))
+                                                   (erlang/== :forward-declaration (elem value 4)))))))))]
              (let [ns (pinned_namespace! defined)
                    shim (BeamLisp.Emit/module_for ns)]
                (if (erlang/not (erlang/== (list) (Map/get value_defs ns (list))))
@@ -612,6 +619,28 @@
     (erlang/error :sdk_declaration_stage_source_evaluation_refused))
   (BeamLisp.Loader/with_declaration_snapshot (fn [] (load_unit_in_snapshot source opts))))
 
+(defn- replay_form? [form]
+  (let [plain (if (reg3? form :meta) (elem form 1) form)]
+    (if (reg3? plain :meta) (replay_form? plain)
+      (and (reg2? plain :list) (erlang/> (erlang/length (elem plain 1)) 0)
+           (reg2? (first (elem plain 1)) :symbol)
+           (let [head (elem (first (elem plain 1)) 1)]
+            (if (= "do" head)
+             (Enum/all? (rest (elem plain 1)) (fn [nested] (replay_form? nested)))
+             (lists/member head
+              (list "ns" "declare" "defn" "defn-" "def" "defmacro" "defserver"
+                    "defrecord" "deftype" "defprotocol" "defmulti" "extend-type"
+                    "extend-protocol" "defnative"))))))))
+
+(defn- expand_replay_form [form ns fuel]
+  ;; Ask the compiler for the actual outer expansion ONCE, then use that same
+  ;; form for collection and evaluation. Unknown calls/actions never gain a
+  ;; replay witness. No macro body is inferred safe from its name.
+  (if (or (replay_form? form) (erlang/== 0 fuel)) form
+    (let [expanded (BeamLisp.Compiler/macroexpand_1 form ns)]
+      (if (erlang/== expanded form) form
+        (expand_replay_form expanded ns (erlang/- fuel 1))))))
+
 (defn- load_unit_in_snapshot
   "Run one compilation unit through the ordinary reader/compiler pipeline and
    return everything the emitters need: `{defined, value_defs, touched, ns_meta,
@@ -647,12 +676,13 @@
          :declaration-namespaces (MapSet/new (cons "user" (Enum/filter (Enum/map forms (fn [form] (ns_decl form)))
                                                    (fn [ns] (erlang/is_binary ns)))))})
       (try
-       (let [acc (Enum/reduce forms (tuple {} (MapSet/new) {})
+       (let [acc (Enum/reduce forms (tuple {} (MapSet/new) {} true)
                 (fn [form a]
                   (let [vdefs (elem a 0)
                         nss (elem a 1)
                         nsmeta (elem a 2)
                         ns (BeamLisp.Env/current_ns)
+                        form (expand_replay_form form ns 128)
                         vdefs2 (capture_value_def vdefs form ns)
                         nsmeta2 (capture_ns_decl nsmeta form)
                         env (Map/put (BeamLisp.Compiler/new_env) :ns (BeamLisp.Env/current_ns))]
@@ -661,7 +691,8 @@
                     (BeamLisp.Compiler/eval_form form
                       (Map/put (Map/put env :file attributed) :aot-normal-declaration-token
                         (Map/get (Process/get :bl_definition_collector) :declaration-token)))
-                    (tuple vdefs2 (MapSet/put nss (or (ns_decl form) ns)) nsmeta2))))]
+                    (tuple vdefs2 (MapSet/put nss (or (ns_decl form) ns)) nsmeta2
+                      (and (elem a 3) (replay_form? form))))))]
       ; export every def the unit left behind its shim's forwarding handler
       ; (BUG-112): one shim rebuild per namespace for the whole unit
       (when (erlang/function_exported :Elixir.BeamLisp.Link :settle 0)
@@ -670,7 +701,10 @@
             owned (MapSet/union (elem acc 1) (MapSet/new (Map/keys (elem acc 2))))
             names (Map/merge defined (Map/take executed (MapSet/to_list owned))
                     (fn [_ lexical observed] (MapSet/union lexical observed)))]
-        (tuple names (elem acc 0) (elem acc 1) (elem acc 2) file
+        (tuple names (elem acc 0) (elem acc 1)
+          (Map/new (Enum/map (Map/to_list (elem acc 2))
+            (fn [pair] (tuple (elem pair 0)
+                         (Map/put (elem pair 1) :replay-complete (elem acc 3)))))) file
           (Map/get (Process/get :bl_definition_collector) :declarations))))
        (finally
         (if previous (Process/put :bl_definition_collector previous)
@@ -959,6 +993,16 @@
     (reg3? form :meta)
       (capture_value_def vdefs (elem form 1) ns)
 
+    ;; A defining macro can emit a sequence of declarations. Collect each
+    ;; value in authored order; functions are collected by the normal producer.
+    ;; Without this, the build VM sees the definition but fresh artifact replay
+    ;; loses it (notably proc.super/defsupervisor's descriptor).
+    (and (reg2? form :list) (seq (elem form 1))
+         (reg2? (first (elem form 1)) :symbol)
+         (= "do" (elem (first (elem form 1)) 1)))
+      (Enum/reduce (rest (elem form 1)) vdefs
+        (fn [nested out] (capture_value_def out nested ns)))
+
     ; `(def ^:private …)` / `(def ^:per-env …)`: the NAME carries metadata.
     (and (reg2? form :list)
          (erlang/>= (erlang/length (elem form 1)) 2)
@@ -981,6 +1025,16 @@
             :else vdefs)
           (capture_value_def vdefs
             (tuple :list (cons (tuple :symbol "def") (cons inner remaining))) ns)))
+
+    ;; Forward declarations must also exist when an artifact initializes in a
+    ;; fresh environment. The guarded declaration preserves already-bound fns.
+    (and (reg2? form :list) (erlang/> (erlang/length (elem form 1)) 0)
+         (reg2? (first (elem form 1)) :symbol)
+         (erlang/== "declare" (elem (first (elem form 1)) 1)))
+      (Map/update vdefs ns
+        (list (tuple nil nil (compile_initializer form (BeamLisp.Compiler/new_env ns)) false :forward-declaration))
+        (fn [entries] (erlang/++ entries
+          (list (tuple nil nil (compile_initializer form (BeamLisp.Compiler/new_env ns)) false :forward-declaration)))))
 
     ; the define-by-interning forms, matched on the head symbol
     (and (reg2? form :list)
@@ -1321,15 +1375,28 @@
         stamp_key (when-not floor? (BeamLisp.AOTCache/key_for_ns ns))
         provenance_key (if floor? :floor stamp_key)
         unit_attrs (erlang/++
-                     (list (tuple :bl_source_hash source_hash)
+                     ;; Namespace initializer companions also export the def
+                     ;; table. Cache provenance validates the complete unit,
+                     ;; so every artifact carries the same protocol version.
+                     (list (tuple :bl_aot_replay_version 1)
+                           (tuple :bl_source_hash source_hash)
                            (tuple :bl_unit_source_digest input_digest)
                            (tuple :bl_aot_artifact_version 1)
                            (tuple :bl_unit_namespace ns))
                      (if floor? (list) (list (tuple :bl_compiler_key stamp_key))))
+        namespace_init (namespace_init_module_for ns)
         init_pair (build_init_ast ns mod stable_defs value_defs ns_meta unit_attrs declarations)
         partitioned (partition_macro_values ns stable_defs (elem init_pair 0) (elem init_pair 1) unit_attrs)
         ns_defs (elem partitioned 0)
         init_clause (elem partitioned 1)
+        namespace_init_descriptor
+        (BeamLisp.Emit/descriptor_for namespace_init
+          (list (Map/put init_clause :fname :__bl_init_namespace__)
+                (BeamLisp.Emit/function_clause :__bl_ns_defs__ (BeamLisp.Emit/lit ns_defs)))
+          (erlang/++ unit_attrs
+            (list (tuple :bl_aot_artifact_role :initializer)
+                  (tuple :bl_sdk_initializer_lambda_kind :namespace)))
+          {:file filename})
         companion_descriptor (elem partitioned 2)
         macro_descriptor (elem partitioned 3)
         generated_beams (erlang/++ (elem init_pair 2)
@@ -1344,7 +1411,8 @@
                      ; shares, which `Env/ns_defs` reads instead of an ETS copy.
                      (list provenance_clause
                            (BeamLisp.Emit/function_clause :__bl_ns_defs__ (BeamLisp.Emit/lit ns_defs))
-                           init_clause))
+                           (BeamLisp.Emit/function_clause :__bl_init__
+                             (BeamLisp.Emit/remote namespace_init :__bl_init_namespace__ (list)))))
           (fn [clause]
             (let [ann (Map/put (Map/merge {:file filename :line 1}
                                  (Map/get (get clause :body) :ann {}))
@@ -1357,6 +1425,7 @@
                 ;; A previous pinned emitter can stamp new live source keys.
                 ;; Verify the actual replay format independently of that key.
                 (tuple :bl_aot_replay_version 1)
+                (tuple :bl_aot_replay_complete (erlang/== true (Map/get ns_meta :replay-complete)))
                 (tuple :bl_unit_source_digest input_digest)
                 (tuple :bl_aot_artifact_version 1)
                 (tuple :bl_aot_artifact_role :mutable-forwarder)
@@ -1367,10 +1436,10 @@
                   (when (and (erlang/is_map declarations) (Map/has_key? declarations :callable-kinds))
                     (tuple 1 ns (Map/get (Map/get declarations :callable-kinds) ns {}))))
                 (tuple :bl_aot_unit_members
-                  (tuple :members (Enum/uniq (erlang/++
+                  (tuple :members (Enum/uniq (cons namespace_init (erlang/++
                     (Enum/map generated_beams (fn [beam] (elem beam 0)))
                     (erlang/++ (Enum/map (Map/to_list (BeamLisp.Emit/body_modules ns_defs)) (fn [entry] (elem entry 0)))
-                      (List/wrap (when companion_descriptor (Map/get companion_descriptor :name))))))))
+                      (List/wrap (when companion_descriptor (Map/get companion_descriptor :name)))))))))
                 (tuple :bl_aot_forwarder_routes
                   (Map/new (Enum/flat_map ns_defs
                     (fn [entry] (Enum/map (elem entry 1)
@@ -1393,7 +1462,7 @@
         beams (erlang/++ generated_beams
                 (Enum/map
                   (erlang/++ (erlang/++ body_descriptors (List/wrap companion_descriptor))
-                             (list namespace_descriptor))
+                             (list namespace_init_descriptor namespace_descriptor))
                   (fn [d] (BeamLisp.Emit/compile_descriptor d))))
         body_mods (MapSet/new body_descriptors (fn [d] (get d :name)))
         split (Enum/split_with beams (fn [b] (MapSet/member? body_mods (elem b 0))))
@@ -1416,6 +1485,7 @@
       ;; stabilized AOT body identities, before readers may obtain evidence.
       (BeamLisp.Env/link_ns_defs ns mod)
       (materialize_unit_callables! ns mod previous)
+      (BeamLisp.Env/mark_emitted ns mod)
       written)))
 
 (defn- write_beam
@@ -1432,6 +1502,17 @@
         (File/rename! tmp path)
         (tuple mod path))
       (finally (File/rm tmp)))))
+
+(defn- namespace_init_module_for [ns]
+  (Module/concat (list (init_module_for ns) :Namespace)))
+
+(defn- namespace_initializer [ns mod]
+  (let [companion (namespace_init_module_for ns)]
+    (if (and (Code/ensure_loaded? companion)
+             (erlang/function_exported companion :__bl_init_namespace__ 0))
+      (tuple companion :__bl_init_namespace__)
+      (when (and (Code/ensure_loaded? mod) (erlang/function_exported mod :__bl_init__ 0))
+        (tuple mod :__bl_init__)))))
 
 (defn- init_module_for
   "The initializer companion module: `BeamLisp.Ns.Init.<Ns>`."
@@ -1734,39 +1815,33 @@
        (let [offset (+ 4 (* index 24))
              function (Map/get atoms (binary/decode_unsigned (binary/part table-bytes offset 4)))
              arity (binary/decode_unsigned (binary/part table-bytes (+ offset 4) 4))
-             slot (binary/decode_unsigned (binary/part table-bytes (+ offset 12) 4))
              free (binary/decode_unsigned (binary/part table-bytes (+ offset 16) 4))]
         (when-not (and (erlang/is_atom function) (<= free arity 255)
-                       (not (Map/has_key? output slot))) (erlang/error :invalid_sdk_lambda_table))
-        (recur (inc index) (Map/put output slot (tuple function (- arity free) free)))))))))))
+                       (not (Map/has_key? output index))) (erlang/error :invalid_sdk_lambda_table))
+        ;; fun_info(:new_index) selects the FunT row ordinal. The field at
+        ;; offset 12 is the legacy index and can differ after lambda sorting.
+        (recur (inc index) (Map/put output index (tuple function (- arity free) free)))))))))))
 
 (defn- sdk_seed_lambda_origin [bytes]
  ;; Seed ownership does not make compiler macro constructors runtime callables.
  ;; Derive the same finite origin from actual authenticated seed attributes.
- (let [attrs (Keyword/get (elem (elem (beam_lib/chunks bytes (list :attributes)) 1) 1) :attributes)
+ ;; Validate the lambda table once, including macro-only initializers; filtering
+ ;; runtime routes must not skip malformed-table validation.
+ (let [routes (sdk_lambda_routes! bytes)
+       attrs (Keyword/get (elem (elem (beam_lib/chunks bytes (list :attributes)) 1) 1) :attributes)
        role (normalized_attribute attrs :bl_aot_artifact_role)
        kind (normalized_attribute attrs :bl_sdk_initializer_lambda_kind)]
-  (when (and kind (not (and (= :initializer role) (contains? #{:values :macros} kind))))
+  (when (and kind (not (and (= :initializer role) (contains? #{:values :macros :namespace} kind))))
    (erlang/error :sdk_bootstrap_initializer_lambda_kind_invalid))
   {:initializer-lambda-kind kind
    :seed-runtime-lambdas? (and (not= :macros kind) (or (not= :initializer role) (= :values kind)))
    :lambda-routes (if (and (not= :macros kind) (or (not= :initializer role) (= :values kind)))
-                    (sdk_lambda_routes! bytes) {})}))
+                    routes {})}))
 
 (defn- sdk_record_ctor_origins! [mod bytes]
- ;; Exact native constructor factory instruction references identify their
- ;; lambda slots. Never infer constructor authority from a lambda name prefix.
  (if (not= mod :Elixir.BeamLisp.Record) {}
-  (let [functions (elem (beam_disasm/file bytes) 5)]
-   (Enum/reduce functions {}
-    (fn [function out]
-     (let [name (elem function 1) arity (elem function 2)]
-      (if-not (and (= 1 arity) (contains? #{:positional_ctor :map_ctor} name)) out
-       (Enum/reduce (elem function 4) out
-        (fn [instruction out]
-         (if (and (erlang/is_tuple instruction) (>= (erlang/tuple_size instruction) 5)
-                   (contains? #{:make_fun2 :make_fun3} (elem instruction 0)))
-          (Map/put out (elem instruction 2) name) out))))))))))
+  (BeamLisp.PackageAuthority/factory_lambda_origins! mod bytes
+   {(tuple :positional_ctor 1) :positional_ctor (tuple :map_ctor 1) :map_ctor})))
 
 (defn- sdk_kernel_primitive_routes! [entries]
  ;; The exact bootstrap ABI literal is an explicit public primitive table,
@@ -2013,6 +2088,7 @@
           (Map/put {} mfa {:version 1 :kind :raw-reduced-sentinel :md5 (Map/get kernel :md5)}) {}))]
   {:version 1 :modules modules :targets targets :bindings bindings :classes classes :prepared-identity prepared-identity
    :inert-arguments inert-arguments
+   :guarded-callbacks (BeamLisp.PackageAuthority/kernel_callback_origins! entries)
    :names (Enum/reduce targets {} (fn [entry out]
             (let [mfa (elem entry 0) key (tuple (elem mfa 0) (elem mfa 1)) kind (elem entry 1)]
              (Map/update out key kind (fn [old] (sdk_merge_target_kind old kind))))))}))
@@ -2051,7 +2127,7 @@
         callable (normalized_attribute attrs :bl_sdk_callable_kinds)
         initializer_kind (normalized_attribute attrs :bl_sdk_initializer_lambda_kind)]
     (when (and initializer_kind
-               (not (and (= :initializer role) (contains? #{:values :macros} initializer_kind))))
+               (not (and (= :initializer role) (contains? #{:values :macros :namespace} initializer_kind))))
       (erlang/error :sdk_inventory_invalid_initializer_lambda_kind))
     (when (and (not (nil? callable))
                (not (and (= :mutable-forwarder role)
@@ -2247,16 +2323,30 @@
     (erlang/map_size modules)))
 
 (defn- inventory_term [path]
-  (let [bytes (File/read! path)]
-    (when (erlang/> (erlang/byte_size bytes) 16777216) (erlang/error :sdk_inventory_too_large))
-    (let [inventory (erlang/binary_to_term bytes (list :safe))]
-      (when-not (and (erlang/is_map inventory) (erlang/== 2 (Map/get inventory :version))
-                    (erlang/== :binary (Map/get inventory :identities))
-                    (erlang/== (BeamLisp.AOTCache/compiler_key) (Map/get inventory :compiler-key))
-                    (erlang/is_map (Map/get inventory :modules))
-                    (erlang/=< (erlang/map_size (Map/get inventory :modules)) 32768))
-        (erlang/error :invalid_sdk_code_inventory))
-      (Map/get inventory :modules))))
+  (BeamLisp.Env/sdk_inventory_metadata! (File/read! path) nil))
+
+(defn- inventory_row [path module]
+  (BeamLisp.Env/sdk_inventory_metadata! (File/read! path) (Atom/to_string module)))
+
+(defn decode_sdk_inventory!
+  "Decode inert SDK ownership data. The private native cache invokes this fixed
+   decoder; every executable row is still checked against source and BEAM bytes."
+  [bytes]
+  (when-not (and (erlang/is_binary bytes) (erlang/=< (erlang/byte_size bytes) 16777216))
+    (erlang/error :sdk_inventory_too_large))
+  (let [inventory (erlang/binary_to_term bytes (list :safe))
+        modules (when (erlang/is_map inventory) (Map/get inventory :modules))]
+    (when-not (and (erlang/is_map inventory) (erlang/== 2 (Map/get inventory :version))
+                  (erlang/== :binary (Map/get inventory :identities))
+                  (erlang/== (BeamLisp.AOTCache/compiler_key) (Map/get inventory :compiler-key))
+                  (erlang/is_map modules) (erlang/=< (erlang/map_size modules) 32768)
+                  (erlang/=< (erlang/external_size modules) 33554432)
+                  (Enum/all? modules (fn [entry]
+                    (and (erlang/is_binary (elem entry 0))
+                         (erlang/=< (erlang/byte_size (elem entry 0)) 512)
+                         (erlang/is_map (elem entry 1))))))
+      (erlang/error :invalid_sdk_code_inventory))
+    modules))
 
 (defn- register_cached_sdk_unit! [ns modules directory]
   (let [path (BeamLisp.Loader/source_path ns)]
@@ -2275,9 +2365,11 @@
           root (physical_sdk_path (BeamLisp.Tiers/priv_root))]
       (when-not (and source root (String/starts_with? source (erlang/iolist_to_binary (list root "/"))))
         (erlang/error :framework_declaration_outside_sdk))
-      (let [key (ns_closure_hash ns) compiler (BeamLisp.AOTCache/compiler_key)
-            cache (BeamLisp.AOTCache/entry_dir compiler key)
-            modules (BeamLisp.AOTCache/valid_keyed_entry cache compiler key)]
+      ;; Build-driver units are stamped with the build key, exactly as emission
+      ;; and the manifest fallback below require. The compiler bucket misses them.
+      (let [key (ns_closure_hash ns) tier-key (BeamLisp.AOTCache/key_for_ns ns)
+            cache (BeamLisp.AOTCache/entry_dir tier-key key)
+            modules (BeamLisp.AOTCache/valid_keyed_entry cache tier-key key)]
         (if (and modules (Enum/member? modules mod)
                  (Enum/member? modules (BeamLisp.Emit/module_for ns)))
           (register_cached_sdk_unit! ns modules cache)
@@ -2307,14 +2399,16 @@
         cached (when (erlang/function_exported :Elixir.BeamLisp.Env :source_seed_metadata 1)
                  (BeamLisp.Env/source_seed_metadata sha))]
    (or cached
-    (let [disassembly (beam_disasm/file bytes) exports (elem disassembly 2)
-        attrs (Keyword/get (elem (elem (beam_lib/chunks bytes (list :attributes)) 1) 1) :attributes)
+    (let [chunks (elem (elem (beam_lib/chunks bytes (list :attributes :exports)) 1) 1)
+        exports (Keyword/get chunks :exports)
+        attrs (Keyword/get chunks :attributes)
         ns (normalized_attribute attrs :bl_unit_namespace)]
     (when (and (erlang/is_binary ns) (erlang/== mod (BeamLisp.Emit/base_module_for ns))
                (Enum/any? exports
                     (fn [entry] (and (erlang/== :__bl_ns_defs__ (elem entry 0))
                                      (erlang/== 0 (elem entry 1))))))
-      (let [functions (Enum/reject (elem disassembly 5)
+      (let [disassembly (beam_disasm/file bytes)
+            functions (Enum/reject (elem disassembly 5)
                         (fn [f] (Enum/member? (list :module_info :__bl_ns_defs__ :__bl_init__ :__bl_provenance__) (elem f 1))))
             routes (Map/new (Enum/map functions
                        (fn [f]
@@ -2349,7 +2443,8 @@
   ;; Cache byte-derived data, never a blanket authorization. Every caller must
   ;; separately compare live code or validate protected forwarder routes.
   (let [key (tuple :Elixir.BeamLisp.AOT :seed_metadata
-                   (BeamLisp.Bootstrap/seed_dir) (BeamLisp.AOTCache/compiler_key) mod)
+                   (BeamLisp.Bootstrap/seed_dir) (BeamLisp.AOTCache/compiler_key)
+                   (erlang/apply :Elixir.BeamLisp.AOT :module_info (list :md5)) mod)
         hit (persistent_term/get key nil)]
     (if (and hit (= expected (Map/get hit :sha-hex)))
       (Map/get hit :proof)
@@ -2357,7 +2452,7 @@
             sha (crypto/hash :sha256 bytes) hex (String/downcase (Base/encode16 sha))
             md5 (elem (elem (beam_lib/md5 bytes) 1) 1)]
         (when-not (= expected hex) (erlang/error :sdk_bootstrap_artifact_changed))
-        (let [proof (Map/merge {:role :stable-seed :seed? true :lambda-routes (sdk_lambda_routes! bytes)
+        (let [proof (Map/merge {:role :stable-seed :seed? true
                                 ;; Canonical compiler data is read from authenticated bytes,
                                 ;; never by executing an extensible live Core shim.
                                 :kernel-definitions (when (= mod :Elixir.BeamLisp.Ns.Core)
@@ -2456,12 +2551,15 @@
 ;; The complete current-input vm.native unit authenticates its pure descriptor
 ;; API before any global callable is invoked. Claimed registry rows only select
 ;; physical SDK source discovery; they never grant native executable authority.
-(defn- sdk_compiler_row [mod]
-  (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root)) image (Path/join root "sdk-code.term")]
-    (if (File/exists? image)
-      (let [identity (Atom/to_string mod) row (Map/get (inventory_term image) identity)]
-        (when row (image_sdk_entry! root identity row)))
-      (source_sdk_receipt mod))))
+(defn- sdk_inventory_input []
+  (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root))
+        image (Path/join root "sdk-code.term")]
+    (tuple root (when (File/exists? image) (File/read! image)))))
+
+(defn- sdk_compiler_row
+  ([mod] (sdk_compiler_row mod (sdk_inventory_input)))
+  ([mod input]
+   (BeamLisp.PackageAuthority/sdk_compiler_row mod input)))
 
 (defn- exact_sdk_function! [ns name arity]
  (when-not (sdk_unit_compiled? ns) (erlang/error (tuple :sdk_native_producer_not_compiled ns)))
@@ -2510,14 +2608,16 @@
 ;; (measured: 22% of application start). Keep it beside the AOT cache, addressed
 ;; by the source digest and the compiler key (which covers the reader). It is
 ;; still only syntax: every caller re-checks source and native identity.
+(defn- native_declaration_name [digest ns]
+  (erlang/iolist_to_binary (list (Base/encode16 digest (list (tuple :case :lower))) "-"
+                                (Base/encode16 (crypto/hash :sha256 ns) (list (tuple :case :lower))))))
+
 (defn- native_declaration_path [digest ns]
   (Path/join (Path/join (Path/join (BeamLisp.AOTCache/dir) "native-declarations")
-                        (BeamLisp.AOTCache/compiler_key))
-             (erlang/iolist_to_binary (list (Base/encode16 digest (list (tuple :case :lower))) "-"
-                                            (Base/encode16 (crypto/hash :sha256 ns) (list (tuple :case :lower)))))))
+                        (BeamLisp.AOTCache/compiler_key)) (native_declaration_name digest ns)))
 
-(defn- disk_native_declaration [digest ns]
-  (let [r (File/read (native_declaration_path digest ns))]
+(defn- read_native_declaration [path digest ns]
+  (let [r (File/read path)]
     (when (and (erlang/is_tuple r) (erlang/== :ok (elem r 0)))
       (try
         (let [t (erlang/binary_to_term (elem r 1) (list :safe))]
@@ -2525,6 +2625,31 @@
                      (erlang/== digest (elem t 0)) (erlang/== ns (elem t 1)))
             (elem t 2)))
         (catch _ nil)))))
+
+(defn- disk_native_declaration [digest ns]
+  (or (read_native_declaration
+        (Path/join (Path/join (Path/join (BeamLisp.Tiers/priv_root) "native-declarations")
+                              (BeamLisp.AOTCache/compiler_key)) (native_declaration_name digest ns)) digest ns)
+      (read_native_declaration (native_declaration_path digest ns) digest ns)))
+
+(defn prime_native_declarations!
+  "Ship content-keyed native syntax with the SDK, as with its source parts.
+   Fresh machines need no reader pass to rediscover already-built declarations.
+   Every use still verifies source bytes and physical native code identity."
+  [root]
+  (let [output (Path/join (Path/join root "native-declarations") (BeamLisp.AOTCache/compiler_key))]
+    (File/mkdir_p! output)
+    (Enum/reduce (BeamLisp.Tiers/sources root) 0
+      (fn [path count]
+        (let [content (BeamLisp.Loader/read_source path)]
+          (if (String/contains? content "defnative")
+            (let [ns (BeamLisp.Loader/declared_ns content)
+                  declaration (when ns (sdk_native_source_declaration_content ns path content))]
+              (if declaration
+                (let [digest (crypto/hash :sha256 content)]
+                  (File/write! (Path/join output (native_declaration_name digest ns))
+                    (erlang/term_to_binary (tuple digest ns declaration) (list :deterministic)))
+                  (erlang/+ count 1)) count)) count))))))
 
 (defn- store_native_declaration! [digest ns declaration]
   (try
@@ -2869,19 +2994,32 @@
     (assert_sdk_seed_snapshot! manifest)
     result))
 
-(defn- image_sdk_entry! [root identity row]
-  ;; Only a selected root/import is loaded. The full image manifest remains
-  ;; provenance for unrelated units; it is never an eager execution schedule.
+(defn- sdk_image_artifact_path [root identity]
   (when-not (and (erlang/is_binary identity) (erlang/=< 1 (erlang/byte_size identity))
                 (erlang/=< (erlang/byte_size identity) 512)
                 (erlang/== identity (Path/basename identity))
                 (erlang/not (String/contains? identity "\\")))
     (erlang/error :invalid_sdk_inventory_module_name))
-  (let [bytes (File/read! (Path/join (Path/dirname root)
-                (erlang/iolist_to_binary (list "ebin/" identity ".beam"))))
+  (Path/join (Path/dirname root) (str "ebin/" identity ".beam")))
+
+(defn- image_sdk_entry! [root identity row]
+  ;; Only a selected root/import is loaded. The full image manifest remains
+  ;; provenance for unrelated units; it is never an eager execution schedule.
+  (let [bytes (File/read! (sdk_image_artifact_path root identity))
         _ (when-not (erlang/== (crypto/hash :sha256 bytes) (Map/get row :sha256))
             (erlang/error :sdk_runtime_artifact_changed))
-        mod (elem (elem (beam_lib/md5 bytes) 1) 0)
+        decoded (BeamLisp.Env/sdk_image_metadata! identity row bytes)
+        mod (erlang/element 1 decoded)]
+    ;; Loading can execute native on_load. Keep it OUTSIDE the metadata cache's
+    ;; owner turn; that cache only decodes authenticated bytes into inert data.
+    (when-not (Code/ensure_loaded? mod) (erlang/error :sdk_image_imports_changed))
+    (erlang/element 2 decoded)))
+
+(defn decode_sdk_image_metadata!
+  "Pure decoding for the native metadata cache. No loading, evaluation, caller
+   callback or ownership publication. Live code/source checks remain at use."
+  [identity row bytes]
+  (let [mod (elem (elem (beam_lib/md5 bytes) 1) 0)
         imports (Enum/uniq (Enum/map
                   (Keyword/get (elem (elem (beam_lib/chunks bytes (list :imports)) 1) 1) :imports)
                   (fn [entry] (elem entry 0))))
@@ -2891,15 +3029,14 @@
         callable (normalized_attribute attrs :bl_sdk_callable_kinds)
         initializer_kind (normalized_attribute attrs :bl_sdk_initializer_lambda_kind)]
     (when (and initializer_kind
-               (not (and (= :initializer (Map/get row :role)) (contains? #{:values :macros} initializer_kind))))
+               (not (and (= :initializer (Map/get row :role)) (contains? #{:values :macros :namespace} initializer_kind))))
       (erlang/error :sdk_image_invalid_initializer_lambda_kind))
     (when (and (Map/has_key? row :initializer-lambda-kind)
                (not= initializer_kind (Map/get row :initializer-lambda-kind)))
       (erlang/error :sdk_image_initializer_lambda_kind_changed))
     (when-not (and (erlang/== identity (Atom/to_string mod))
                   (erlang/== (Enum/sort (Map/get row :imports))
-                    (Enum/sort (Enum/map imports (fn [dependency] (Atom/to_string dependency)))))
-                  (Code/ensure_loaded? mod))
+                    (Enum/sort (Enum/map imports (fn [dependency] (Atom/to_string dependency))))))
       (erlang/error :sdk_image_imports_changed))
     (when (and (not (nil? callable))
                (not (and forwarder? (sdk_callable_descriptor? callable (Map/get row :forwarder-namespace))
@@ -2915,12 +3052,15 @@
                        (erlang/== declarations (Map/get row :declarations)))
           (erlang/error :sdk_image_declaration_metadata_changed)))
       (verify_sdk_forwarder! (tuple mod bytes) (Map/get row :forwarder-namespace) routes))
-    (Map/merge row {:imports imports :forwarder-routes routes :callable-kinds callable
+    (tuple mod (Map/merge row {:imports imports :forwarder-routes routes :callable-kinds callable
                     :initializer-lambda-kind initializer_kind
+                    :ctor-lambda-origins (sdk_record_ctor_origins! mod bytes)
                     :lambda-routes (when (or (= :stable-body (Map/get row :role))
+                                             (and (= :stable-seed (Map/get row :role))
+                                                  (Map/get row :seed-runtime-lambdas?))
                                              (and (= :initializer (Map/get row :role)) (= :values initializer_kind)))
                                      (sdk_lambda_routes! bytes))
-                    :binding-routes (when forwarder? (sdk_binding_routes! mod bytes routes))})))
+                    :binding-routes (when forwarder? (sdk_binding_routes! mod bytes routes))}))))
 
 (defn- complete_image_sdk_closure! [root inventory]
   (let [manifest (BeamLisp.Bootstrap/manifest)
@@ -2957,11 +3097,8 @@
   ([source-targets?] (sdk_runtime_inventory_uncached! source-targets?)))
 
 (defn- sdk_runtime_inventory_uncached! [source-targets?]
-  (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root)) path (Path/join root "sdk-code.term")
-        entries (if (File/exists? path) (complete_image_sdk_closure! root (inventory_term path))
-                  (complete_source_sdk_closure!
-                    (Map/merge (Map/merge (source_seed_inventory!) (source_sdk_receipts))
-                               (sdk_native_receipts))))]
+  (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root))
+        entries (BeamLisp.PackageAuthority/runtime_sdk_entries! root)]
     (when (or (erlang/== 0 (erlang/map_size entries)) (erlang/> (erlang/map_size entries) 8192))
       (erlang/error :invalid_sdk_runtime_inventory_size))
     (Enum/each entries
@@ -3081,7 +3218,7 @@
   (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root))
         inventory_path (Path/join root "sdk-code.term") image? (File/exists? inventory_path)
         _ (when-not image? (ensure_source_sdk_evidence! ns mod))
-        row (if image? (Map/get (inventory_term inventory_path) (Atom/to_string mod))
+        row (if image? (inventory_row inventory_path mod)
                 (source_sdk_receipt mod))]
     (when-not (and row (erlang/== (tuple ns name) (Map/get row :declaration-owner))
                   (erlang/== (BeamLisp.AOTCache/compiler_key) (Map/get row :compiler-key)))
@@ -3107,7 +3244,7 @@
    may deliberately preserve older metadata while keeping the same BEAM MD5."
   [mod]
   (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root)) path (Path/join root "sdk-code.term")
-        row (if (File/exists? path) (Map/get (inventory_term path) (Atom/to_string mod))
+        row (if (File/exists? path) (inventory_row path mod)
                 (source_sdk_receipt mod))
         owner (when row (Map/get row :declaration-owner))]
     (when-not (and (erlang/is_atom mod) (erlang/is_tuple owner)
@@ -3407,7 +3544,8 @@
         ; Link publication needs the canonical declarations before it replaces
         ; the shim; its resulting overlay must never be relinked afterward.
         table_ops (list (BeamLisp.Emit/remote :Elixir.BeamLisp.Env :link_ns_defs
-                          (list (BeamLisp.Emit/lit ns) (BeamLisp.Emit/lit mod))))
+                          (list (BeamLisp.Emit/lit ns) (BeamLisp.Emit/lit mod)
+                                (BeamLisp.Emit/lit (namespace_init_module_for ns)))))
         body (BeamLisp.Emit/sequence
                (erlang/++
                  (list (BeamLisp.Emit/remote :Elixir.BeamLisp.Loader :assert_initializer_execution_allowed!
@@ -3459,9 +3597,19 @@
                             ;; Existing SDK lifetime: extend BEFORE initializer
                             ;; effects, for image and ordinary cached source alike.
                             (BeamLisp.Env/refresh_sdk_runtime!)
-                            (do (ensure_source_sdk_evidence! ns mod)
+                            (do
+                                ;; A lazy boot namespace belongs to the verified
+                                ;; floor, not an ordinary source-cache unit. Its
+                                ;; exact seed artifact is already the SDK issuer.
+                                (when-not (and (floor_file? source)
+                                               (= mod (BeamLisp.Emit/module_for ns))
+                                               (or (seed_dependency! mod)
+                                                   (seed_forwarder_dependency_from_manifest! mod (BeamLisp.Bootstrap/manifest))))
+                                  (ensure_source_sdk_evidence! ns mod))
                                 (BeamLisp.Env/refresh_sdk_runtime!))))))
-                    (erlang/apply mod :__bl_init__ (list))
+                    (let [initializer (namespace_initializer ns mod)]
+                      (when-not initializer (erlang/error (tuple :namespace_initializer_missing ns)))
+                      (erlang/apply (elem initializer 0) (elem initializer 1) (list)))
                     (BeamLisp.Env/mark_loaded ns))))))
           :loaded)))))
 
@@ -3489,8 +3637,7 @@
     (if (and (library_tier? ns) (erlang/not (BeamLisp.Env/loaded_ns? ns))
              (staged_sdk_source? ns source))
       (compile_sdk_source! ns (BeamLisp.Loader/read_source source) source)
-    (if (and (Code/ensure_loaded? mod)
-             (erlang/function_exported mod :__bl_init__ 0))
+    (if (and (Code/ensure_loaded? mod) (namespace_initializer ns mod))
       (cond
         (BeamLisp.Env/loaded_ns? ns)
           :loaded
@@ -3652,6 +3799,17 @@
         modules)
       (finally (File/rm_rf out)))))))
 
+(defn replayable_cached_source? [ns path]
+  ;; The source classifier cannot establish a custom macro's expansion. Only
+  ;; actual complete artifacts under this compiler/source closure can do so.
+  ;; This is a strict boolean predicate: Loader/load_route uses erlang/not.
+  (try
+    (let [key (ns_closure_hash ns path)
+          prepared (when key (BeamLisp.AOTCache/prepare_fetch
+                               (BeamLisp.AOTCache/key_for_source path) key))]
+      (and (erlang/is_map prepared) (BeamLisp.AOTCache/prepared_replay_complete? prepared)))
+    (catch _ false)))
+
 (defn- repair_library
   "Repair a stale or missing LIBRARY artifact. Returns `:loaded` when the
    namespace is now usable, `:no_module` when no repair is possible (another
@@ -3792,447 +3950,8 @@
                     :else false))))))))
     (catch _ false)))
 
-(defn- package_module_identity [module]
-  (when (erlang/not (erlang/module_loaded module))
-    (erlang/error (tuple :unloaded_package_compiler module)))
-  (tuple module (erlang/apply module :module_info (list :md5))))
-
-(defn- package_callable_module [module]
-  ;; Core/Rt generated shims add exports as applications define functions.
-  ;; Their fixed compiler-support captures target canonical body functions;
-  ;; bind that implementation rather than unrelated shim export additions.
-  ;; Arbitrary raw code:load_binary shim overrides are outside this contract.
-  (cond
-    (erlang/== module :Elixir.BeamLisp.Ns.Core) :Elixir.BeamLisp.Ns.Body.Core
-    (erlang/== module :Elixir.BeamLisp.Ns.Rt) :Elixir.BeamLisp.Ns.Body.Rt
-    :else module))
-
-(defn- portable_package_terms
-  ([values depth budget] (portable_package_terms values depth budget false))
-  ([values depth budget rt-operator?]
-  (let [result (Enum/reduce values (tuple (list) budget)
-                 (fn [value acc]
-                   (let [one (portable_package_value value depth (elem acc 1) rt-operator?)]
-                     (tuple (erlang/++ (list (elem one 0)) (elem acc 0)) (elem one 1)))))]
-    (tuple (Enum/reverse (elem result 0)) (elem result 1)))))
-
-(defn- portable_package_value
-  "Finite, unambiguous portable compiler evidence. Stage/user local closures,
-   process identities and reference-backed values never become release authority.
-   Only seeded Core operator evidence admits exact canonical RT local lambdas.
-   Regex structs retain their exact compiled literal as well as source/options;
-   source-only normalization could conceal a changed executable pattern."
-  [value depth budget rt-operator?]
-  (when (or (erlang/> depth 64) (erlang/=< budget 0))
-    (erlang/error :package_compiler_value_bound))
-  (let [remaining (erlang/- budget 1)]
-    (cond
-      (or (erlang/is_atom value) (erlang/is_integer value) (erlang/is_float value))
-      (tuple (tuple :literal value) remaining)
-      (erlang/is_binary value)
-      (do (when (erlang/> (erlang/byte_size value) 1048576)
-            (erlang/error :package_compiler_binary_bound))
-          (tuple (tuple :literal value) remaining))
-      (erlang/is_function value)
-      (let [type (elem (erlang/fun_info value :type) 1)
-            module (elem (erlang/fun_info value :module) 1)
-            name (elem (erlang/fun_info value :name) 1)
-            arity (elem (erlang/fun_info value :arity) 1)]
-        (if (erlang/== :external type)
-          (tuple (tuple :external_function (package_module_identity (package_callable_module module)) name arity) remaining)
-          ;; RT seeds variadic arithmetic/comparison operators as local
-          ;; closures, sometimes capturing another RT operator. This narrow
-          ;; context binds their actual compiled lambda identity and recursively
-          ;; portable environment; stage/user/local closures remain refused.
-          (if (and rt-operator? (erlang/== :local type)
-                   (erlang/== :Elixir.BeamLisp.Ns.Body.Rt module))
-            (let [environment (elem (erlang/fun_info value :env) 1)
-                  unique (elem (erlang/fun_info value :new_uniq) 1)
-                  index (elem (erlang/fun_info value :new_index) 1)
-                  normalized (portable_package_terms environment (erlang/+ depth 1) remaining true)]
-              (when (erlang/not (and (erlang/is_binary unique) (erlang/== 16 (erlang/byte_size unique))
-                                    (erlang/is_integer index) (erlang/>= index 0)))
-                (erlang/error :invalid_rt_operator_identity))
-              (tuple (tuple :rt_operator_closure (package_module_identity module)
-                            name arity unique index (elem normalized 0)) (elem normalized 1)))
-            (erlang/error :nonportable_package_compiler_closure))))
-      (erlang/is_tuple value)
-      (do (when (erlang/> (erlang/tuple_size value) 8192)
-            (erlang/error :package_compiler_tuple_bound))
-          (let [result (portable_package_terms (erlang/tuple_to_list value) (erlang/+ depth 1) remaining rt-operator?)]
-            (tuple (tuple :tuple (elem result 0)) (elem result 1))))
-      (erlang/is_list value)
-      (let [result (portable_package_terms value (erlang/+ depth 1) remaining rt-operator?)]
-        (tuple (tuple :list (elem result 0)) (elem result 1)))
-      (erlang/is_map value)
-      (do (when (erlang/> (erlang/map_size value) 8192)
-            (erlang/error :package_compiler_map_bound))
-          (let [result (portable_package_terms (maps/to_list value) (erlang/+ depth 1) remaining rt-operator?)
-                ;; Binary term ordering distinguishes equal-valued integer/float
-                ;; keys and does not depend on map traversal/insertion order.
-                ordered (Enum/sort_by (elem result 0) (fn [pair] (erlang/term_to_binary pair)))]
-            (tuple (tuple :map ordered) (elem result 1))))
-      :else (erlang/error :nonportable_package_compiler_value))))
-
-(defn- package_macro_value? [value]
-  (and (erlang/is_tuple value) (erlang/== 2 (erlang/tuple_size value))
-       (erlang/== :"$macro" (elem value 0))))
-
-(defn- package_namespace_bindings [ns budget]
-  (let [canonical (maps/keys (BeamLisp.Env/ns_defs ns))
-        ;; Exact namespace value rows also include literal def constants, which
-        ;; can alter code generation without rebuilding a forwarding shim.
-        rows (BeamLisp.Env/match (tuple (tuple ns :"$1") :"$2"))
-        _ (when (or (erlang/> (erlang/length canonical) 2048)
-                    (erlang/> (erlang/length rows) 4096))
-            (erlang/error :package_compiler_binding_bound))
-        names (Enum/sort (Enum/uniq (erlang/++ canonical
-                  (Enum/flat_map rows (fn [row]
-                    (let [name (first row) value (second row)]
-                      ;; Ordinary body macros are syntactically outside local
-                      ;; AOT admission. Exclude only non-function-table macro
-                      ;; bindings, never a replaced canonical function.
-                      (if (and (erlang/is_binary name)
-                               (or (erlang/not (package_macro_value? value))
-                                   (lists/member name canonical)))
-                        (list name) (list))))))))]
-    (let [values (Enum/map names (fn [name]
-                    (let [found (BeamLisp.Env/lookup (tuple ns name))]
-                      (when (erlang/== :error found)
-                        (erlang/error (tuple :missing_package_compiler_binding ns name)))
-                      (tuple name (elem found 1)))))
-          result (portable_package_terms values 0 budget)]
-      (tuple (tuple ns (elem result 0)) (elem result 1)))))
-
-(defn- package_body_module [ns]
-  ;; Namespace dots delimit alias segments; camelizing the whole dotted string
-  ;; changes the case of its final segment (notably clojure.core-ext).
-  (Enum/reduce (String/split ns ".") :Elixir.BeamLisp.Ns.Body
-    (fn [segment module] (Module/concat module (Macro/camelize segment)))))
-
-(defn- package_support_index [names]
-  ;; Only canonical boot namespaces are compiler support. Index function
-  ;; identities, not complete Core/Rt tables or mutable shim export lists.
-  (Enum/reduce names {:functions {} :definitions {} :modules {}}
-    (fn [ns acc]
-      (let [defs (BeamLisp.Env/ns_defs ns)
-            body (package_body_module ns)
-            shim (BeamLisp.Emit/base_module_for ns)]
-        (when (erlang/> (erlang/map_size defs) 2048)
-          (erlang/error :package_support_definition_bound))
-        (Enum/reduce defs
-          (assoc acc :modules (maps/put body ns (maps/put shim ns (:modules acc))))
-          (fn [pair out]
-            (let [name (elem pair 0) entries (elem pair 1) key (tuple ns name)]
-              (when (erlang/not (erlang/is_list entries))
-                (erlang/error :unsupported_package_support_definition))
-              (Enum/reduce entries
-                (assoc out :definitions (maps/put key entries (:definitions out)))
-                (fn [entry result]
-                  (when (erlang/not (and (erlang/is_tuple entry) (erlang/>= (erlang/tuple_size entry) 4)
-                                        (erlang/is_map (elem entry 3))
-                                        (erlang/== :defn-clause (maps/get :op (elem entry 3) nil))))
-                    (erlang/error :unsupported_package_support_entry))
-                  (let [fname (elem entry 2)]
-                    (assoc result :functions
-                      (maps/put (tuple body fname) key
-                        (maps/put (tuple shim fname) key (:functions result))))))))))))))
-
-(defn- package_support_enqueue [state key]
-  (if (maps/is_key key (:seen state)) state
-    (do
-      (when (erlang/>= (erlang/map_size (:seen state)) 4096)
-        (erlang/error :package_support_work_bound))
-      (assoc state :seen (maps/put key true (:seen state))
-                   :todo (erlang/++ (list key) (:todo state))))))
-
-(defn- package_support_callable [state index module name]
-  (let [key (maps/get (tuple module name) (:functions index) nil)
-        ns (maps/get module (:modules index) nil)]
-    (cond
-      key (package_support_enqueue state key)
-      ns (erlang/error (tuple :unknown_package_support_function ns name))
-      ;; Unknown compiled namespace closures may hide arbitrary Env fetches.
-      (String/starts_with? (Atom/to_string module) "Elixir.BeamLisp.Ns.")
-        (erlang/error (tuple :unknown_package_support_namespace module name))
-      :else state)))
-
-(defn- package_support_captures [value state index depth]
-  (when (or (erlang/> depth 64) (erlang/=< (:nodes state) 0))
-    (erlang/error :package_support_walk_bound))
-  (let [next (assoc state :nodes (erlang/- (:nodes state) 1))]
-    (cond
-      (erlang/is_function value)
-        (let [module (elem (erlang/fun_info value :module) 1)
-              name (elem (erlang/fun_info value :name) 1)
-              type (elem (erlang/fun_info value :type) 1)]
-          (if (erlang/== type :external)
-            (package_support_callable next index module name)
-            ;; Normalization has already restricted local closures to RT.
-            (Enum/reduce (elem (erlang/fun_info value :env) 1)
-              (package_support_enqueue
-                (package_support_enqueue next (tuple "rt" "seed-closures"))
-                (tuple "rt" "chain-of"))
-              (fn [v acc] (package_support_captures v acc index (erlang/+ depth 1))))))
-      (erlang/is_tuple value)
-        (Enum/reduce (erlang/tuple_to_list value) next
-          (fn [v acc] (package_support_captures v acc index (erlang/+ depth 1))))
-      (erlang/is_list value)
-        (Enum/reduce value next
-          (fn [v acc] (package_support_captures v acc index (erlang/+ depth 1))))
-      (erlang/is_map value)
-        (Enum/reduce (maps/to_list value) next
-          (fn [v acc] (package_support_captures v acc index (erlang/+ depth 1))))
-      :else next)))
-
-(defn- package_support_exact_candidates [ns name seen]
-  (when (erlang/> (erlang/length seen) 64)
-    (erlang/error :package_support_resolution_bound))
-  (if (lists/member ns seen) {:pairs (list) :declarations (list) :names (list)}
-    (let [declaration (BeamLisp.Env/lookup (tuple :refer ns name))
-          source (if (erlang/== :error declaration) nil (elem declaration 1))
-          tail (if source (package_support_exact_candidates source name (erlang/++ (list ns) seen))
-                 {:pairs (list) :declarations (list) :names (list)})]
-      {:pairs (erlang/++ (list (tuple ns name)) (:pairs tail))
-       :declarations (erlang/++ (list (tuple ns name declaration)) (:declarations tail))
-       :names (erlang/++ (list ns) (:names tail))})))
-
-(defn- package_support_candidate_value [pairs]
-  ;; Match fetch's env-first candidate precedence without materializing a
-  ;; per-env descriptor or demand-loading an undeclared compiler dependency.
-  (Enum/find_value (BeamLisp.Env/chain) :error
-    (fn [env]
-      (Enum/find_value pairs nil
-        (fn [pair]
-          (let [row (ets/lookup :beam_lisp_vars (BeamLisp.Env/pfx env pair))]
-            (when (erlang/not (erlang/== (list) row))
-              (tuple :ok (elem (erlang/hd row) 1)))))))))
-
-(defn- package_support_resolution [ns name exact?]
-  (if exact?
-    (let [result (package_support_exact_candidates ns name (list))]
-      (assoc result :found (package_support_candidate_value (:pairs result))))
-    (let [parts (String/split name "/" (list (tuple :parts 2)))
-          prefix (erlang/hd parts)
-          alias (BeamLisp.Env/lookup (tuple :alias ns prefix))
-          refer (BeamLisp.Env/lookup (tuple :refer ns name))
-          names (if (and (erlang/== 2 (erlang/length parts)) (erlang/=/= "" prefix))
-                  (list (if (erlang/== :error alias) prefix (elem alias 1)))
-                  (erlang/++ (list ns "core" "sugar")
-                    (if (erlang/== :error refer) (list) (list (elem refer 1)))))]
-      {:found (BeamLisp.Env/peek ns name)
-       :names (erlang/++ (list ns) names)
-       :declarations (list alias refer)})))
-
-(defn- package_support_global [node state index]
-  (let [ns (maps/get :ns node) name (maps/get :name node)
-        exact? (erlang/== :exact (maps/get :lookup node nil))
-        key (tuple ns name exact?)]
-    (if (maps/is_key key (:fetches state)) state
-      (let [resolution (package_support_resolution ns name exact?)
-            declarations (:declarations resolution)
-            found (:found resolution)
-            names (Enum/reduce (:names resolution) (:names state)
-                    (fn [candidate acc]
-                      (when (erlang/not (and (erlang/is_binary candidate)
-                                            (erlang/=< (erlang/byte_size candidate) 512)))
-                        (erlang/error :unsupported_package_support_namespace))
-                      (when (erlang/>= (erlang/map_size acc) 128)
-                        (erlang/error :package_support_namespace_bound))
-                      (maps/put candidate true acc)))]
-        (when (erlang/== :error found)
-          (erlang/error (tuple :missing_package_support_value ns name)))
-        (when (erlang/>= (erlang/map_size (:fetches state)) 8192)
-          (erlang/error :package_support_fetch_bound))
-        (let [evidence (portable_package_terms (list declarations found) 0 (:values state) true)
-              next (assoc state :values (elem evidence 1) :names names
-                         :fetches (maps/put key (elem evidence 0) (:fetches state)))]
-          (package_support_captures (elem found 1) next index 0))))))
-
-(defn- package_support_walk [node state index depth]
-  (when (or (erlang/> depth 256) (erlang/=< (:nodes state) 0))
-    (erlang/error :package_support_walk_bound))
-  (let [next (assoc state :nodes (erlang/- (:nodes state) 1))]
-    (cond
-      ;; Quoted payloads and source annotations are data, not executable nodes.
-      (and (erlang/is_map node)
-        (or (erlang/== :lit (maps/get :op node nil))
-            (erlang/== :plit (maps/get :pop node nil)))) next
-      (erlang/is_map node)
-        (let [with-global (if (erlang/== :global (maps/get :op node nil))
-                            (package_support_global node next index) next)
-              with-call (if (erlang/== :remote (maps/get :op node nil))
-                          (package_support_callable with-global index (maps/get :mod node) (maps/get :fun node))
-                          with-global)]
-          (Enum/reduce (maps/values (maps/remove :ann node)) with-call
-            (fn [v acc] (package_support_walk v acc index (erlang/+ depth 1)))))
-      (erlang/is_list node)
-        (Enum/reduce node next
-          (fn [v acc] (package_support_walk v acc index (erlang/+ depth 1))))
-      (erlang/is_tuple node)
-        (Enum/reduce (erlang/tuple_to_list node) next
-          (fn [v acc] (package_support_walk v acc index (erlang/+ depth 1))))
-      :else next)))
-
-(defn- package_support_drain [state index]
-  (if (erlang/== (list) (:todo state)) state
-    (let [key (erlang/hd (:todo state))
-          entries (maps/get key (:definitions index) nil)]
-      (when (erlang/== nil entries)
-        (erlang/error :missing_package_support_definition))
-      (let [ns (elem key 0)
-            body (package_body_module ns)
-            next (assoc state :todo (erlang/tl (:todo state))
-                         :code (maps/put body (package_module_identity body) (:code state)))
-            walked (Enum/reduce entries next
-                     (fn [entry acc] (package_support_walk (elem entry 3) acc index 0)))]
-        (package_support_drain walked index)))))
-
-(defn- package_support_projection [stages names budget]
-  (let [index (package_support_index names)
-        initial {:todo (list) :seen {} :fetches {} :code {} :nodes 1000000 :values budget
-                 :names (Map/new names (fn [ns] (tuple ns true)))}
-        seeded (Enum/reduce stages initial
-                 (fn [ns state]
-                   (Enum/reduce (maps/keys (BeamLisp.Env/ns_defs ns)) state
-                     (fn [name acc] (package_support_enqueue acc (tuple ns name))))))
-        result (package_support_drain seeded index)]
-    (tuple (tuple :compiler_support
-                   (Enum/sort (maps/to_list (:fetches result)))
-                   (Enum/sort (maps/to_list (:code result)))) (:values result)
-           (Enum/sort (maps/keys (:names result))))))
-
-(defn- package_authority_add_fingerprint [row acc]
-  (let [module (elem row 0) md5 (elem row 1) old (maps/get module acc nil)]
-    (when (and old (erlang/=/= old md5))
-      (erlang/error :incoherent_package_compiler_code))
-    (when (erlang/>= (erlang/map_size acc) 256)
-      (erlang/error :package_compiler_module_bound))
-    (maps/put module md5 acc)))
-
-(defn- package_authority_capture_fingerprints [node acc]
-  ;; Input is already normalized and bounded. Callable tags are generated by
-  ;; the normalizer; literal tuples have a distinct :tuple wrapper.
-  (cond
-    (erlang/is_tuple node)
-      (if (and (erlang/> (erlang/tuple_size node) 1)
-               (or (erlang/== :external_function (elem node 0))
-                   (erlang/== :rt_operator_closure (elem node 0))))
-        (Enum/reduce (erlang/tuple_to_list node)
-          (package_authority_add_fingerprint (elem node 1) acc)
-          (fn [v out] (package_authority_capture_fingerprints v out)))
-        (Enum/reduce (erlang/tuple_to_list node) acc
-          (fn [v out] (package_authority_capture_fingerprints v out))))
-    (erlang/is_list node)
-      (Enum/reduce node acc (fn [v out] (package_authority_capture_fingerprints v out)))
-    :else acc))
-
-(defn- package_authority_fingerprints [code bindings operators support]
-  (let [base (Enum/reduce code {} (fn [row out] (package_authority_add_fingerprint row out)))
-        body (Enum/reduce (elem (elem support 0) 2) base
-               (fn [row out] (package_authority_add_fingerprint (elem row 1) out)))
-        all (package_authority_capture_fingerprints
-              (tuple (elem bindings 0) (elem operators 0) (elem support 0)) body)]
-    (Enum/sort (maps/to_list all))))
-
-(defn- package_generation_projection [rows]
-  ;; A live, empty fork adds no compiler definitions. Keep every global row
-  ;; and every nonzero scoped generation; namespace_generations has already
-  ;; refused dead scopes and in-flight publications before normalization.
-  (when rows
-    (Enum/filter rows (fn [row] (or (erlang/== :global (elem row 0))
-                                  (erlang/not (erlang/== 0 (elem row 2))))))))
-
-(defn- package_authority_memo_valid? [memo]
-  (let [before (BeamLisp.Env/namespace_generations (:names memo))
-             first-code (Enum/map (:fingerprints memo)
-                          (fn [row] (package_module_identity (elem row 0))))
-             after (BeamLisp.Env/namespace_generations (:names memo))
-             last-code (Enum/map (:fingerprints memo)
-                         (fn [row] (package_module_identity (elem row 0))))]
-         (and before (erlang/== (package_generation_projection before) (:generations memo))
-              (erlang/== before after)
-              (erlang/== first-code (:fingerprints memo))
-              (erlang/== first-code last-code))))
-
-(defn local_package_authority
-  "Portable compiler certificate with one bounded last-entry process memo.
-   Hits bind exact closed namespace/lifetime and actual executable evidence;
-   unrelated application initialization does not traverse compiler metadata."
-  []
-  (let [key (tuple (elem (erlang/fun_info (fn [] nil) :module) 1) :package_authority_memo)]
-    (Process/delete :bl_package_authority_failure)
-    (try
-      (let [memo (Process/get key nil)
-            hit (when memo
-                  (BeamLisp.Env/with_module_locks
-                    (Enum/map (:fingerprints memo) (fn [row] (elem row 0)))
-                    (fn [] (when (package_authority_memo_valid? memo) (:authority memo)))))]
-        (if hit (do (Process/put key (assoc memo :env (BeamLisp.Env/env_id))) hit)
-          (do (Process/delete key)
-            (let [fresh (uncached_package_authority)]
-              (when fresh (Process/put key fresh) (:authority fresh))))))
-      (catch _ (Process/delete key) nil))))
-
-(defn local_package_authority_report
- "Explain a declined certificate without changing the admission contract."
- []
- (let [authority (local_package_authority)]
-  (if authority {:authority authority}
-    {:reason (Process/get :bl_package_authority_failure "unsupported scoped compiler context")})))
-
-(defn- uncached_package_authority
-  "Portable closed compiler authority for realm release artifacts. Bind actual
-   callable/value definitions and installed code, not generation counters or
-   mutable Core shim exports. Unsupported live overrides decline."
-  []
-  (try
-    (let [names (list "core" "sugar" "rt" "compiler" "lower" "anf" "reader-node" "diag" "reader" "clojure.core-ext")
-          epoch (BeamLisp.Env/publication_epoch)
-          before (BeamLisp.Env/namespace_generations names)]
-      (when (and before (Enum/all? before (fn [row]
-                        (or (erlang/== :global (elem row 0)) (erlang/== 0 (elem row 2))))))
-        (let [stages (list "sugar" "compiler" "lower" "anf")
-              modules (Enum/flat_map stages (fn [n]
-                        (list (BeamLisp.Emit/base_module_for n)
-                              (package_body_module n))))
-              pinned (erlang/++ (BeamLisp.AOTCache/codegen_modules)
-                       (list :Elixir.BeamLisp.Compiler :Elixir.BeamLisp.Reader))
-              code (Enum/map (Enum/sort (Enum/uniq (erlang/++ modules pinned)))
-                     (fn [module] (package_module_identity module)))
-              bindings (Enum/reduce stages (tuple (list) 100000)
-                         (fn [n acc]
-                           (let [result (package_namespace_bindings n (elem acc 1))]
-                             (tuple (erlang/++ (elem acc 0) (list (elem result 0))) (elem result 1)))))
-              operators (Enum/map (list "+" "-" "*" "/" "=" "<" ">" "<=" ">=")
-                          (fn [n]
-                            (let [found (BeamLisp.Env/lookup (tuple "core" n))
-                                  link (BeamLisp.Env/link "core" n)]
-                              (when (or (erlang/== :error found) (erlang/== :error link))
-                                (erlang/error :missing_package_core_operator))
-                              (tuple n (elem found 1) (elem link 1)))))
-              normalized_ops (portable_package_terms operators 0 (elem bindings 1) true)
-              support (package_support_projection stages names (elem normalized_ops 1))]
-          (when (and (erlang/== epoch (BeamLisp.Env/publication_epoch))
-                     (erlang/== before (BeamLisp.Env/namespace_generations names)))
-            (let [authority (Base/encode16 (crypto/hash :sha256 (erlang/term_to_binary
-                                (tuple :realm_package_compiler_v3 code (elem bindings 0) (elem normalized_ops 0) (elem support 0))))
-                              (list (tuple :case :lower)))
-                  fingerprints (package_authority_fingerprints code bindings normalized_ops support)
-                  closed-names (elem support 2)
-                  generations (BeamLisp.Env/namespace_generations closed-names)
-                  memo {:env (BeamLisp.Env/env_id) :names closed-names :generations (package_generation_projection generations)
-                        :projection_epoch epoch
-                        :fingerprints fingerprints :authority authority}]
-              ;; Metadata traversal takes namespace locks, so it stays outside
-              ;; physical fences. Under fences only reread finite evidence.
-              (BeamLisp.Env/with_module_locks (Enum/map fingerprints (fn [row] (elem row 0)))
-                (fn []
-                  (when (and generations (erlang/== epoch (BeamLisp.Env/publication_epoch))
-                             (package_authority_memo_valid? memo))
-                    memo))))))))
-    (catch error
-      (Process/put :bl_package_authority_failure (Elixir.Exception/message error)) nil)))
+(defn local_package_authority [] (BeamLisp.PackageAuthority/local_package_authority))
+(defn local_package_authority_report [] (BeamLisp.PackageAuthority/local_package_authority_report))
 
 (defn- load_package_local
   [ns provider content]
@@ -4351,11 +4070,16 @@
    dedups its own closure — and no correctness property depends on a caller
    taking a pass."
   [fun]
+  (BeamLisp.Loader/with_declaration_snapshot (fn [] (source_snapshot_pass fun))))
+
+(defn- source_snapshot_pass [fun]
   (if (erlang/== nil (Process/get :bl_source_snapshot))
     (do
       (Process/put :bl_source_snapshot {})
       (let [previous (Process/get :bl_source_info_cache)
-            previous-parts (Process/get :bl_source_parts_cache)]
+            previous-parts (Process/get :bl_source_parts_cache)
+            previous-nodes (Process/get :bl_source_graph_nodes)]
+        (Process/put :bl_source_graph_nodes {})
         (Process/put :bl_source_parts_cache {})
         (try (fun)
           (finally
@@ -4363,7 +4087,9 @@
             (if (erlang/== nil previous) (Process/delete :bl_source_info_cache)
               (Process/put :bl_source_info_cache previous))
             (if (erlang/== nil previous-parts) (Process/delete :bl_source_parts_cache)
-              (Process/put :bl_source_parts_cache previous-parts))))))
+              (Process/put :bl_source_parts_cache previous-parts))
+            (if (nil? previous-nodes) (Process/delete :bl_source_graph_nodes)
+              (Process/put :bl_source_graph_nodes previous-nodes))))))
     (fun)))
 
 (defn ns_closure_hash
@@ -4375,14 +4101,18 @@
   ([ns file] :when (string? ns)
    (let [shared (Process/get :bl_source_snapshot)]
      (if (erlang/== nil shared)
-       (let [previous-parts (Process/get :bl_source_parts_cache)]
+       (let [previous-parts (Process/get :bl_source_parts_cache)
+             previous-nodes (Process/get :bl_source_graph_nodes)]
+         (Process/put :bl_source_graph_nodes {})
          (Process/put :bl_source_info_cache {})
          (Process/put :bl_source_parts_cache {})
          (try (closure_hash_of ns file)
               (finally
                (Process/delete :bl_source_info_cache)
                (if (nil? previous-parts) (Process/delete :bl_source_parts_cache)
-                (Process/put :bl_source_parts_cache previous-parts)))))
+                (Process/put :bl_source_parts_cache previous-parts))
+               (if (nil? previous-nodes) (Process/delete :bl_source_graph_nodes)
+                 (Process/put :bl_source_graph_nodes previous-nodes)))))
        (do
          ; A pass is open: ITS cache is this call's cache. Write the merged
          ; map back to the pass afterwards so the next member is shared.
@@ -4390,53 +4120,48 @@
          (try (closure_hash_of ns file)
               (finally (Process/put :bl_source_snapshot (Process/get :bl_source_info_cache {})))))))))
 
-(defn- closure_hash_of
-  "`ns_closure_hash`'s body, folded against whatever `:bl_source_info_cache`
-   currently holds."
-  [ns file]
-  (let [seed (if (and file (File/exists? file))
-               (list ns (BeamLisp.Loader/read_source file))
-               nil)]
-    ; Packaged runtimes carry beams without source. Answer before loading the
-    ; planner: its own closure vetting would recurse into this gate.
-    (if (and (nil? seed) (nil? (source_content_cached ns)))
-      nil
-      (BeamLisp.BuildPlan/key_for ns (fn [n] (source_content_cached n)) seed
-        (fn [n content] (source_node_cached n content))))))
+(defn- source_resolution_key [ns]
+  (let [dirs (BeamLisp.Loader/search_dirs)]
+    (tuple (BeamLisp.Env/env_id) dirs (BeamLisp.Loader/realm_context) ns
+           (BeamLisp.Loader/package_provider ns)
+           (when (Enum/any? dirs (fn [d] (not= :absolute (Path/type d)))) (File/cwd!)))))
+
+(defn- source_graph_node_cached [ns]
+  (let [key (source_resolution_key ns)
+        cache (Process/get :bl_source_graph_nodes {})]
+    (if (Map/has_key? cache key) (Map/get cache key)
+      (let [content (source_content_cached ns)
+            node (when content (source_node_cached ns content))]
+        (when (< (erlang/map_size cache) 8192)
+          (Process/put :bl_source_graph_nodes (Map/put cache key node)))
+        node))))
+
+(defn- closure_hash_of [ns file]
+  (let [seed (when (and file (File/exists? file))
+               (source_node_cached ns (BeamLisp.Loader/read_source file)))
+        nodes (BeamLisp.BuildPlan/nodes_from_resolver ns
+                (fn [name] (if (and seed (= name ns)) seed (source_graph_node_cached name))))]
+    (when nodes (BeamLisp.BuildPlan/key_from_nodes ns nodes))))
 
 (defn- primed_source_parts
- "The content parts `bl self-build` primed into this image for the source
-  whose sha256 is `hash`, or nil. Without this, every cold VM re-parsed each
-  library source it loads (about 11 s of a 20-50 s first `datom` load) even
-  though the drop ships those exact parts under `priv/parts/<build-key>/`.
-
-  Same file format as build-plan's: `sha256(payload) ++ payload`, the payload a
-  deterministic `term_to_binary` of the parts map. Read-only. Trust is the
-  content address: the stored `:hash` must equal the asked hash and the frame
-  digest must match, so a moved or edited file is a miss, never a wrong
-  answer. The build-key directory pins the producer toolchain."
+ "One planner frame protocol for sealed parts and the driver's persistent
+  content store. Reuse bytes-derived data without invoking a mutable planner
+  namespace, initializer, or table owner. Live source bytes still select every
+  content hash; an edited dependency cannot reuse its previous frame."
  [hash]
- (try
-  (let [root (persistent_term/get :bl_primed_parts_dir :unset)
-        root (if (erlang/== root :unset)
-               (let [d (Path/join (Path/join (BeamLisp.Tiers/priv_root) "parts")
-                                  (BeamLisp.AOTCache/build_key))
-                     d (when (File/dir? d) d)]
-                 (persistent_term/put :bl_primed_parts_dir d) d)
-               root)]
-   (when root
-    (let [r (File/read (Path/join root (binary/encode_hex hash)))]
-     (when (erlang/== :ok (elem r 0))
-      (let [f (elem r 1)]
-       (when (erlang/>= (erlang/byte_size f) 32)
-        (let [sp (erlang/split_binary f 32) payload (elem sp 1)]
-         (when (erlang/== (elem sp 0) (crypto/hash :sha256 payload))
-          (let [p (erlang/binary_to_term payload (list :safe))]
-           (when (and (erlang/is_map p)
-                      (erlang/== (Map/get p :hash) (binary/encode_hex hash))
-                      (Map/has_key? p :headers))
-            p))))))))))
-  (catch _ nil)))
+ (let [root (persistent_term/get :bl_primed_parts_dir :unset)
+       root (if (erlang/== root :unset)
+              (let [d (Path/join (Path/join (BeamLisp.Tiers/priv_root) "parts")
+                                 (BeamLisp.AOTCache/build_key))
+                    d (when (File/dir? d) d)]
+                (persistent_term/put :bl_primed_parts_dir d) d)
+              root)
+       name (binary/encode_hex hash)]
+  (or (when root (BeamLisp.AOTCache/read_source_parts (Path/join root name) hash))
+      (when (BeamLisp.AOTCache/enabled?)
+       (BeamLisp.AOTCache/read_source_parts
+        (Path/join (Path/join (Path/join (BeamLisp.AOTCache/dir) "parts")
+                               (BeamLisp.AOTCache/build_key)) name) hash)))))
 
 (defn- source_node_cached
  "Pure content-derived parsing memo scoped to this freshness validation pass.
@@ -4460,8 +4185,7 @@
    name cannot reuse an absent/live result after provider installation, or use
    another environment's immutable source fallback."
   [ns]
-  (let [key (tuple (BeamLisp.Env/env_id) (Process/get :bl_search_dirs nil) ns
-                   (BeamLisp.Loader/package_provider ns))
+  (let [key (source_resolution_key ns)
         cache (Process/get :bl_source_info_cache {})]
     (if (erlang/is_map_key key cache)
       (Map/get cache key)
@@ -4639,30 +4363,10 @@
 
 
 (defn sdk_unit_compiled? [ns]
-  (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root))
-        source (physical_sdk_path (BeamLisp.Loader/source_path ns))
-        shim (BeamLisp.Emit/module_for ns) row (sdk_compiler_row shim)
-        members (when row
-                  (Enum/map (Map/get row :unit-references (list))
-                    (fn [member]
-                      (if (erlang/is_binary member) (String/to_existing_atom member) member))))]
-    (and root source row (erlang/is_list members) (erlang/=< 0 (erlang/length members))
-         (erlang/=< (erlang/length members) 8192)
-         (String/starts_with? source (erlang/iolist_to_binary (list root "/")))
-         (erlang/== ns (BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source source)))
-         (erlang/== :mutable-forwarder (Map/get row :role))
-         (erlang/== ns (Map/get row :forwarder-namespace))
-         (erlang/== (Path/relative_to source root) (Map/get row :source))
-         (erlang/== (crypto/hash :sha256 (BeamLisp.Loader/read_source source)) (Map/get row :source-digest))
-         (erlang/== (BeamLisp.AOTCache/compiler_key) (Map/get row :compiler-key))
-         (Enum/all? (cons shim members)
-           (fn [mod]
-             (let [member (sdk_compiler_row mod)]
-               (and member (erlang/module_loaded mod)
-                    (erlang/== (Map/get row :source) (Map/get member :source))
-                    (erlang/== (Map/get row :source-digest) (Map/get member :source-digest))
-                    (erlang/== (Map/get row :compiler-key) (Map/get member :compiler-key))
-                    (erlang/== (Map/get member :md5) (erlang/apply mod :module_info (list :md5))))))))))
+ (BeamLisp.PackageAuthority/sdk_unit_compiled? ns))
+
+(defn- sdk_unit_compiled_from_inventory? [ns input]
+ (BeamLisp.PackageAuthority/sdk_unit_compiled_from_inventory? ns input))
 
 (defn- sdk_declaration_descriptor? [descriptor ns]
   (and (erlang/is_binary ns) (<= 1 (erlang/byte_size ns)) (<= (erlang/byte_size ns) 512)
@@ -4730,19 +4434,7 @@
       (tuple pass context (BeamLisp.Env/env_id) code definitions))))
 
 (defn- sdk_checked_declaration_table [ns]
-  (let [row (sdk_compiler_row (BeamLisp.Emit/module_for ns))
-        descriptor (when row (Map/get row :declarations))]
-    ;; Ordinary/application providers with no staged descriptor do not require
-    ;; source parsing, byte hashing or a full unit walk merely for this query.
-    (when (sdk_declaration_descriptor? descriptor ns)
-      (let [source (when (Process/get :bl_declaration_snapshot_id)
-                     (BeamLisp.Loader/declaration_source_identity ns))
-            root (physical_sdk_path (BeamLisp.Tiers/priv_root))]
-        (if (and (or (nil? (Process/get :bl_declaration_snapshot_id))
-                     (and source (= (Map/get row :source-digest) (elem source 1))
-                          (= (Map/get row :source)
-                             (Path/relative_to (physical_sdk_path (elem source 0)) root))))
-                 (sdk_unit_compiled? ns)) descriptor :unavailable)))))
+  (BeamLisp.PackageAuthority/sdk_checked_declaration_table ns))
 
 (defn- sdk_callable_kind [head]
  (cond (contains? #{"defn" "defn-"} head) :function
@@ -4771,7 +4463,12 @@
   ;; Physical Source selection only. This does not grant execution authority.
   (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root)) source (physical_sdk_path path)]
     (and (library_tier? ns) root source
-         (String/starts_with? source (erlang/iolist_to_binary (list root "/")))
+         ;; Fixed SDK ownership follows the actual packaged library tiers.
+         ;; Tooling under self/ is ordinary source, even when its namespace
+         ;; falls through to the loader's generic :library classification.
+         (Enum/any? (BeamLisp.Tiers/library_names)
+          (fn [tier] (String/starts_with? source
+                       (erlang/iolist_to_binary (list root "/" tier "/")))))
          (erlang/== ns (BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source source))))))
 
 (defn- sdk_preinit_seed_member! [manifest mod source]
@@ -4868,6 +4565,115 @@
              (and (Code/ensure_loaded? (ns_body_module ns))
                   (erlang/function_exported (ns_body_module ns) :__bl_callable_values__ 0))))))
 
+(defn- sdk_image_preload_unit [ns root bytes]
+  (let [shim (BeamLisp.Emit/module_for ns)
+        raw (BeamLisp.Env/sdk_inventory_metadata! bytes (Atom/to_string shim))]
+    (when raw
+      (let [source (physical_sdk_path (sdk_native_source_path ns))
+            content (when source (BeamLisp.Loader/read_source source))
+            references (Map/get raw :unit-references)
+            identities (when (erlang/is_list references)
+                         (cons (Atom/to_string shim) references))]
+        (when-not (and source content
+                       (erlang/== (BeamLisp.AOTCache/compiler_key) (Map/get raw :compiler-key))
+                       (String/starts_with? source (str root "/"))
+                       (erlang/== (Path/relative_to source root) (Map/get raw :source))
+                       (erlang/== (crypto/hash :sha256 content) (Map/get raw :source-digest))
+                       identities (erlang/=< (erlang/length identities) 8192))
+          (erlang/error (tuple :sdk_image_preload_source_changed ns)))
+        (let [header (BeamLisp.SourceGraph/header*-nodes
+                       (list (BeamLisp.Reader/read_first content source)))
+              _ (when-not (erlang/== ns (nth header 0))
+                  (erlang/error :sdk_image_preload_namespace_changed))
+              members
+              (Enum/map identities (fn [identity]
+                (let [row (BeamLisp.Env/sdk_inventory_metadata! bytes identity)
+                      file (sdk_image_artifact_path root identity)
+                      object (File/read! file)]
+                  (when-not (and row (erlang/== (Map/get raw :source) (Map/get row :source))
+                                 (erlang/== (Map/get raw :source-digest) (Map/get row :source-digest))
+                                 (erlang/== (crypto/hash :sha256 object) (Map/get row :sha256)))
+                    (erlang/error :sdk_image_preload_artifact_changed))
+                  ;; The fixed decoder reads data only: no on_load or namespace
+                  ;; initializer may run while assembling this whole batch.
+                  (let [decoded (BeamLisp.Env/sdk_image_metadata! identity row object)
+                        metadata (elem decoded 1)
+                        references (Map/get metadata :unit-references)
+                        metadata (if (erlang/is_list references)
+                                   (Map/put metadata :unit-references
+                                     (Enum/map references (fn [name]
+                                       (if (erlang/is_binary name) (String/to_existing_atom name) name)))) metadata)]
+                    {:module (elem decoded 0) :row metadata :file file :bytes object}))))]
+          {:namespace ns :requires (nth header 1) :members members})))))
+
+(defn- sdk_image_preload_plan [ns root bytes]
+  (loop [pending (list ns) seen (MapSet/new) units (list) size 0]
+    (cond
+      (erlang/> (MapSet/size seen) 1024) nil
+      (erlang/> size 67108864) nil
+      (erlang/== pending (list))
+        (let [members (Enum/flat_map units (fn [unit] (Map/get unit :members)))]
+          (when (erlang/=< (erlang/length members) 8192)
+            (verify_complete_sdk_units! (Map/new (Enum/map members
+              (fn [member] (tuple (Map/get member :module) (Map/get member :row))))))
+            members))
+      :else
+        (let [name (erlang/hd pending) rest (erlang/tl pending)]
+          (if (or (MapSet/member? seen name) (BeamLisp.Env/loaded_ns? name))
+            (recur rest seen units size)
+            (let [unit (sdk_image_preload_unit name root bytes) next (MapSet/put seen name)]
+              ;; Boot/build and optional source-only providers retain their
+              ;; ordinary load path. No source is evaluated to fill a missing unit.
+              (if-not unit (recur rest next units size)
+                (recur (erlang/++ (Map/get unit :requires) rest) next (cons unit units)
+                       (erlang/+ size (Enum/reduce (Map/get unit :members) 0
+                         (fn [member total] (erlang/+ total (erlang/byte_size (Map/get member :bytes))))))))))))))
+
+(defn- preload_sdk_image_closure! [ns]
+  ;; Only normal sealed-SDK loading with an existing lifetime takes this path.
+  ;; Only the serialized loader may batch: private owner turns never wait for
+  ;; code fences. Compile-only staging and checkouts keep their existing protocol.
+  (when (and (erlang/== (erlang/self) (Process/whereis :Elixir.BeamLisp.Loader.Server))
+             (ets/member :beam_lisp_vars :bl_sdk_runtime_lease)
+             (erlang/not (erlang/== true (Process/get :bl_loader_initialization_blocked)))
+             (erlang/== nil (source_sdk_receipt (BeamLisp.Emit/module_for ns))))
+    (let [input (sdk_inventory_input) root (elem input 0) bytes (elem input 1)
+          members (when bytes (sdk_image_preload_plan ns root bytes))]
+      (when (and members (erlang/not (erlang/== members (list))))
+        (let [fresh (Enum/reject members (fn [member] (erlang/module_loaded (Map/get member :module))))
+              objects (Enum/map fresh (fn [member]
+                        (tuple (Map/get member :module) (String/to_charlist (Map/get member :file))
+                               (Map/get member :bytes))))
+              prepared (code/prepare_loading objects)]
+          ;; OTP's preparation rejects on_load without running it. Such a graph
+          ;; uses ordinary loading, preserving its native effect ordering.
+          (when (and (erlang/is_tuple prepared) (erlang/== :ok (elem prepared 0)))
+            (let [loaded (BeamLisp.Env/with_module_locks
+                           (Enum/sort (Enum/map fresh (fn [member] (Map/get member :module))))
+                           (fn []
+                             ;; A concurrent loader won. Discard this optional
+                             ;; preparation; normal per-unit admission rechecks it.
+                             (when (Enum/all? fresh (fn [member]
+                                       (erlang/not (erlang/module_loaded (Map/get member :module)))))
+                               (let [result (BeamLisp.Env/with_code_evidence_publication
+                                              (fn [] (code/finish_loading (elem prepared 1))))]
+                                 (when-not (erlang/== :ok result)
+                                   (erlang/error (tuple :sdk_image_preload_failed result)))
+                                 true))))]
+              (when loaded
+                ;; Current executable identities are checked BEFORE publishing
+                ;; any compiler receipts. The normal issuer then verifies the
+                ;; complete live source/artifact closure before extending custody.
+                (Enum/each members (fn [member]
+                  (let [mod (Map/get member :module) row (Map/get member :row)]
+                    (when-not (and (erlang/module_loaded mod)
+                                   (or (erlang/== (Map/get row :md5) (erlang/apply mod :module_info (list :md5)))
+                                       (and (erlang/== :mutable-forwarder (Map/get row :role))
+                                            (BeamLisp.Env/sdk_forwarder_current? mod (Map/get row :forwarder-routes)))))
+                      (erlang/error :sdk_image_preload_loaded_code_changed)))))
+                (publish_sdk_emission_entries! (Enum/map members (fn [member]
+                  (tuple (tuple :bl_sdk_emission (Map/get member :module)) (Map/get member :row)))))))))))))
+
 (defn compile_sdk_source! [ns content path]
   ;; One compile-only declaration producer for cold pre-lease and warm retained
   ;; SDK loading. It never evaluates Source to discover callable provenance.
@@ -4876,6 +4682,9 @@
                    (sdk_library_source? ns path)
                    (erlang/== content (BeamLisp.Loader/read_source source)))
       (erlang/error (tuple :sdk_source_stage_input_mismatch ns path)))
+    ;; Admit the already compiled dependency group once before its first
+    ;; initializer. Each namespace still replays its own effects normally.
+    (preload_sdk_image_closure! ns)
     ;; Normal packaged/current cached units can already carry the exact checked
     ;; metadata and factory. Recover their existing receipt before considering
     ;; a real staged repair; failed evidence never falls back to initialization.
@@ -5212,8 +5021,10 @@
  (let [file (Keyword/get opts :file nil)
        forms (BeamLisp.Reader/read_string source file)
        header (stage-preflight! forms) ns (:ns header)
-       previous (BeamLisp.Env/current_ns)]
+       previous (BeamLisp.Env/current_ns)
+       prior-declarations (Process/get :bl_sdk_stage_declarations)]
   (try
+   (Process/put :bl_sdk_stage_declarations {})
    (BeamLisp.Env/declare_ns ns) (BeamLisp.Env/in_ns ns)
    (doseq [pair (Map/get (:metadata header) :aliases)]
     (BeamLisp.Env/add_alias ns (elem pair 0) (elem pair 1)))
@@ -5231,8 +5042,12 @@
            (let [metadata (capture_ns_decl {} (first forms))
                  declaration (first (filter #(= "defnative" (stage-head %)) (rest forms)))]
             (if declaration (assoc-in metadata [ns :native-declaration] (stage-native declaration)) metadata)) file
-           (when (constructor_context) (Map/get (constructor_context!) :declarations {}))))
-   (finally (BeamLisp.Env/in_ns previous)))))
+           (if (constructor_context) (Map/get (constructor_context!) :declarations {})
+             (Process/get :bl_sdk_stage_declarations {}))))
+   (finally
+    (if prior-declarations (Process/put :bl_sdk_stage_declarations prior-declarations)
+      (Process/delete :bl_sdk_stage_declarations))
+    (BeamLisp.Env/in_ns previous)))))
 
 ;; HOME integration draft. The object path selects current source discovery;
 ;; only new compiler output can subsequently supply executable authority.
@@ -5575,8 +5390,9 @@
   "Non-authorizing data-class evidence. This never grants actor adoption."
   [mod]
   (try
+    (and (erlang/is_atom mod) (erlang/not (erlang/== nil (BeamLisp.Record/info mod)))
     (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root)) image (Path/join root "sdk-code.term")
-          row (if (File/exists? image) (Map/get (inventory_term image) (Atom/to_string mod))
+          row (if (File/exists? image) (inventory_row image mod)
                   (source_sdk_receipt mod))
           metadata (when row (Map/get row :generated-class))
           source (when row (physical_sdk_path (Path/join root (Map/get row :source))))]
@@ -5592,7 +5408,7 @@
                          (Enum/map (elem metadata 4) (fn [field] (erlang/binary_to_existing_atom field :utf8))))
                       (BeamLisp.Record/info mod))
            (erlang/module_loaded mod) (erlang/== (Map/get row :md5) (erlang/apply mod :module_info (list :md5)))
-           (BeamLisp.Env/sdk_runtime_retained_modules? (list mod))))
+           (BeamLisp.Env/sdk_runtime_retained_modules? (list mod)))))
     (catch _ false)))
 
 
@@ -5604,13 +5420,13 @@
  (throw (ex-info "Bounded constructor interpretation refused"
                  {:kind :constructor-machine-refused :detail detail})))
 (defn- constructor_counter! [state field delta]
- (let [key (:counter-frame state) counters (erlang/get key)]
+ (let [key (maps/get :counter-frame state nil) counters (erlang/get key)]
   (when-not (and (erlang/is_map counters) (erlang/is_map_key field counters))
    (constructor_refuse :missing-counter-frame))
-  (let [next (+ (erlang/map_get field counters) delta)]
+  (let [next (erlang/+ (erlang/map_get field counters) delta)]
    (erlang/put key (maps/put field next counters)) next)))
 (defn- constructor_step! [state]
- (when (neg? (constructor_counter! state :remaining -1)) (constructor_refuse :step-budget)))
+ (when (erlang/< (constructor_counter! state :remaining -1) 0) (constructor_refuse :step-budget)))
 ;; Data-shape walks (recipe presence, internal cost) are bounded per call by
 ;; the aggregate node budget, but they re-run at every primitive boundary over
 ;; values that grow with the program (a defserver clause plan). Charging them
@@ -5619,9 +5435,9 @@
 ;; are charged to their own :walk-steps budget instead; a frame without one
 ;; (hand-built fixtures) keeps the old shared accounting.
 (defn- constructor_walk_step! [state]
- (let [counters (erlang/get (:counter-frame state))]
+ (let [counters (erlang/get (maps/get :counter-frame state nil))]
   (if (and (erlang/is_map counters) (erlang/is_map_key :walk-steps counters))
-   (when (neg? (constructor_counter! state :walk-steps -1)) (constructor_refuse :walk-budget))
+   (when (erlang/< (constructor_counter! state :walk-steps -1) 0) (constructor_refuse :walk-budget))
    (constructor_step! state))))
 
 (defn- constructor_container_cost! [value state]
@@ -5808,12 +5624,18 @@
   (constructor_refuse :unsupported-stream-operation))
  (when callback (constructor_stream_callback! callback state))
  (constructor_internal_cost! sources state)
- (when (> (count sources) 16) (constructor_refuse :stream-source-budget))
+ ;; Zip/map keeps simultaneous cursors. Concat consumes one inner source at
+ ;; a time, so charge its finite outer list against the ordinary collection
+ ;; and aggregate budgets instead of applying the parallel-cursor ceiling.
+ (when (or (and (not= :concat operation) (> (count sources) 16))
+           (> (count sources) (:max-collection state)))
+  (constructor_refuse :stream-source-budget))
  ;; Bound/charge input copies before retaining a callback graph. Conversion
  ;; inspects eager raw storage only; a deferred source is never forced here.
  (constructor_allocation! (+ 16 (* 8 (count sources))) 0 state)
  (let [recipe (constructor_recipe_new! :input nil nil state)
-       cursors (constructor_stream_mapv! #(constructor_stream_cursor! % state) sources)
+       cursors (if (= :concat operation) []
+                 (constructor_stream_mapv! #(constructor_stream_cursor! % state) sources))
        row {:kind :derived :operator operation :callback callback
             :sources cursors :outer (when (= :concat operation) {:list sources})
             :inner nil :stream-cache [] :stream-nodes 0 :stream-bytes 0
@@ -6125,6 +5947,25 @@
                      :detail :opaque-finite-recipe-observation :operation target}))))))
 
 (defn- constructor_internal_cost! [value state]
+ ;; Terms are immutable and the machine's callable/recipe membership only
+ ;; grows within this private frame. Remember successful raw shape/cost checks
+ ;; by exact term; allocation sites still charge the returned cost every time.
+ ;; Never retain a failed check or reuse this data across interpreter calls.
+ (constructor_walk_step! state)
+ (let [key (maps/get :counter-frame state) frame (erlang/get key)
+       cache (Map/get frame :cost-cache {}) hit (maps/find value cache)]
+  (if (not= :error hit) (elem hit 1)
+   (let [cost (constructor_internal_cost_uncached! value state)
+         frame (erlang/get key) cache (Map/get frame :cost-cache {})
+         used (Map/get frame :cost-cache-bytes 0)
+         size (when (and (> (:nodes cost) 32) (< (erlang/map_size cache) 128))
+                (erlang/external_size value))]
+    (when (and size (<= (+ used size) 4194304))
+     (erlang/put key (maps/put :cost-cache (maps/put value cost cache)
+                        (maps/put :cost-cache-bytes (+ used size) frame))))
+    cost))))
+
+(defn- constructor_internal_cost_uncached! [value state]
  ;; No protocol/Enumerable/callback inspection. Fn values are interpreter-owned
  ;; internal capabilities; source literal/input endpoints reject them. Captured
  ;; environments are charged independently when each capability is constructed.
@@ -6207,12 +6048,20 @@
     (constructor_refuse :keyword-name-budget))
    (constructor_atom! token state))))
 
+(defn- constructor_data_limits []
+ ;; SDK syntax is authenticated source, not an application datum. Use the
+ ;; machine's existing aggregate ceiling for its input/expanded syntax while
+ ;; keeping the public first-order domain's smaller default unchanged. The
+ ;; private staging context selects this, never caller metadata/options.
+ (if (constructor_context)
+  {:max-nodes 65536 :max-bytes 1048576 :max-depth 128} {}))
+
 (defn- constructor_readable! [value state]
  ;; The runtime printer may force deferred objects or invoke Inspect for foreign
  ;; types. Only the shared raw first-order domain is admitted here; no internal
  ;; callback/capsule or protocol-backed object reaches the printer.
- (BeamLisp.CompilerData/check_first_order! value)
- (let [cost (BeamLisp.CompilerData/first_order_cost! value)
+ (BeamLisp.CompilerData/check_first_order! value (Map/get state :data-limits {}))
+ (let [cost (BeamLisp.CompilerData/first_order_cost! value (Map/get state :data-limits {}))
        bound (+ 16 (* 8 (:bytes cost)) (* 8 (:nodes cost)))]
   ;; Covers binary escaping/invalid UTF-8, decimal integer digits, keyword and
   ;; container punctuation conservatively BEFORE any output allocation.
@@ -6243,7 +6092,9 @@
        (and (map? value) (not (contains? value :__struct__)))
         (Enum/map (Map/to_list value) (fn [pair] [(elem pair 0) (elem pair 1)]))
        :else (constructor_refuse :opaque-sequence)))
-(defn- constructor_eager_sequence_bound! [value state]
+(defn- constructor_eager_sequence_bound!
+ ([value state] (constructor_eager_sequence_bound! value state true))
+ ([value state materialize?]
  ;; Rt's eager paths can materialize graphemes/map entries. Bound their input
  ;; BEFORE calling the runtime; approved Vector/Set storage was already checked
  ;; by the shared raw-data gate. Deferred/foreign structs never reach this point.
@@ -6256,12 +6107,13 @@
                   (erlang/is_map value) (erlang/map_size value)
                   :else 0)]
   (when (> size (:max-collection state)) (constructor_refuse :collection-budget))
+  (when materialize?
   (cond
    (erlang/is_binary value) (constructor_allocation! (* 4 size) size state)
    (or (erlang/is_tuple value) (vector? value) (set? value))
     (constructor_allocation! (* 2 size) 0 state)
    (erlang/is_map value) (constructor_allocation! (* 16 size) 0 state)
-   :else nil)))
+   :else nil)))))
 (defn- constructor_eager_last [value]
  (loop [remaining value]
   (let [tail (BeamLisp.Ns.Rt/next remaining)]
@@ -6463,8 +6315,12 @@
   (when (and (= module :Elixir.BeamLisp.Ns.Core)
              (contains? #{"first" "second" "rest" "next" "last" "nth" "count" "empty?"
                           "seq" "take" "drop" "to-list" "vec"} primitive-name))
-   (Enum/each args (fn [value] (constructor_eager_sequence_bound! value state)))
-   (constructor_charge! args state))
+   ;; Reading an existing tree does not allocate that tree again. Retain
+   ;; sequence/materialization bounds and raw walk fuel, but do not spend the
+   ;; allocation quota on every borrowed suffix in a recursive syntax walk.
+   (Enum/each args (fn [value]
+                    (constructor_eager_sequence_bound! value state
+                      (not (contains? #{"count" "empty?"} primitive-name))))))
   (when (and (= module :Elixir.BeamLisp.Ns.Core)
              (contains? #{"concat" "map" "mapv" "mapcat" "vec" "vector" "list" "into"
                           "assoc" "dissoc" "conj" "hash-map" "merge" "set" "str" "join"}
@@ -6554,7 +6410,7 @@
      "conj" (apply conj args) "hash-map" (apply hash-map args)
      "merge" (Enum/reduce args nil (fn [item acc]
                 (if (nil? item) acc (Map/merge (or acc {}) item))))
-     "str" (do (BeamLisp.CompilerData/check_first_order! args) (apply str args))
+     "str" (do (BeamLisp.CompilerData/check_first_order! args (Map/get state :data-limits {})) (apply str args))
      "name" (name (first args)) "symbol" (apply symbol args) "keyword" (constructor_keyword! args state)
      "fn?" (or (erlang/is_function (first args))
                 (and (erlang/is_tuple (first args)) (= 3 (erlang/tuple_size (first args)))
@@ -6704,7 +6560,7 @@
       (constructor_invoke (first args) (erlang/++ leading trailing) state)))
    (= target [:binary :split 2])
     (do
-     (BeamLisp.CompilerData/check_first_order! args)
+     (BeamLisp.CompilerData/check_first_order! args (Map/get state :data-limits {}))
      (when-not (and (erlang/is_binary (first args))
                     (or (erlang/is_binary (second args))
                         (and (erlang/is_list (second args))
@@ -6719,17 +6575,17 @@
                  [:Elixir.BeamLisp.Record :record? 1]} target)
     ;; These exact predicates inspect raw shapes/registered identity only.
     ;; Private recipes/callables and foreign/native values never cross here.
-    (do (BeamLisp.CompilerData/check_first_order! (first args))
+    (do (BeamLisp.CompilerData/check_first_order! (first args) (Map/get state :data-limits {}))
         (erlang/apply module function args))
    (= target [:Elixir.Map :delete 2])
     (do
-     (BeamLisp.CompilerData/check_first_order! args)
+     (BeamLisp.CompilerData/check_first_order! args (Map/get state :data-limits {}))
      (when-not (and (erlang/is_map (first args))
                     (not (maps/is_key :__struct__ (first args))))
       (constructor_refuse :plain-map-delete-domain))
      (Map/delete (first args) (second args)))
    (= target [:Elixir.BeamLisp.Ns.Rt :transientable? 1])
-    (do (BeamLisp.CompilerData/check_first_order! (first args))
+    (do (BeamLisp.CompilerData/check_first_order! (first args) (Map/get state :data-limits {}))
         (BeamLisp.Ns.Rt/transientable? (first args)))
    (= target [:Elixir.BeamLisp.Ns.Rt :print_readably 1])
     (constructor_readable! (first args) state)
@@ -6788,7 +6644,7 @@
  (try
  (let [value
   (case (:op n)
-   :lit (do (BeamLisp.CompilerData/check_first_order! (:val n)) (:val n))
+   :lit (do (BeamLisp.CompilerData/check_first_order! (:val n) (Map/get state :data-limits {})) (:val n))
    :var (if (contains? env (:name n)) (get env (:name n)) (constructor_refuse :unbound-local))
    :global (let [key [(:ns n) (:name n)]
                  alias (when-not (= :exact (:lookup n)) (get (:global-aliases state) key))
@@ -6898,14 +6754,15 @@
 
 (defn interpret_constructor!
  [expression locals metadata]
- (BeamLisp.CompilerData/check_first_order! locals)
- (let [key (tuple :constructor-machine-frame (erlang/make_ref))
-       state (Map/merge metadata {:counter-frame key :max-collection 16384})]
+ (let [limits (constructor_data_limits)
+       _ (BeamLisp.CompilerData/check_first_order! locals limits)
+       key (tuple :constructor-machine-frame (erlang/make_ref))
+       state (Map/merge metadata {:counter-frame key :max-collection 16384 :data-limits limits})]
   (erlang/put key {:remaining 1000000 :walk-steps 16000000 :depth 0 :allocation-nodes 1000000 :allocation-bytes 16777216 :new-atoms 64 :fresh-symbols 4096 :recipe-serial 0 :recipe-depth 0 :recipes {} :callables {}})
   (try
    (let [result (constructor_interpret expression locals state)]
     (when (constructor_recipe_present! result state) (constructor_refuse :finite-recipe-escape))
-    (BeamLisp.CompilerData/check_first_order! result) result)
+    (BeamLisp.CompilerData/check_first_order! result (Map/get state :data-limits {})) result)
    (catch error
     (erlang/raise __EXCEPTION_KIND__ (constructor_diagnostic_error error nil) __STACKTRACE__))
    (finally (erlang/erase key)))))
@@ -6956,7 +6813,7 @@
  ([definitions values namespace binding arguments]
   (constructor_call! definitions values {} namespace binding arguments))
  ([definitions values aliases namespace binding arguments]
- (BeamLisp.CompilerData/check_first_order! arguments)
+ (BeamLisp.CompilerData/check_first_order! arguments (constructor_data_limits))
  (interpret_constructor! {:op :apply :fn {:op :global :ns namespace :name binding}
         :args (Enum/map (BeamLisp.Ns.Rt/k-to-list arguments)
                 (fn [value] {:op :lit :val value}))}
@@ -7076,7 +6933,10 @@
       (BeamLisp.Env/add_core_excludes namespace (list))
       (doseq [pair (Map/get (:metadata header) :aliases)]
        (BeamLisp.Env/add_alias namespace (elem pair 0) (elem pair 1)))
-      (doseq [target (:requires header)] (constructor_unit! target))
+      ;; Requires describe resolution, not a metadata execution schedule.
+      ;; Staged macro/source lookup selects and prelinks the actual callee
+      ;; before compilation uses it. Recursively preparing every require here
+      ;; reparsed the whole SDK closure for EACH unit's constructor context.
       (doseq [pair (Map/get (:metadata header) :refers)]
        (BeamLisp.Env/add_refer namespace (elem pair 0) (elem pair 1)))
       (doseq [target (Map/get (:metadata header) :refer_alls)]
@@ -7558,18 +7418,20 @@
     (and (erlang/is_map metadata) (= true (maps/get :private metadata false)))))
 
 (defn- sdk_record_declaration! [form namespace bindings kind]
-  (when (constructor_context)
-    (let [private? (sdk_checked_private? form)
-          declarations (Map/get (constructor_context!) :declarations {})
-          names (Map/get declarations namespace {})
-          kinds (Map/get declarations :callable-kinds {})
-          prior-kinds (Map/get kinds namespace {})]
-      (constructor_context_put! :declarations
-        (Map/put (Map/put declarations namespace
-          (Enum/reduce bindings names
-            (fn [binding out] (Map/put out binding (if private? :private kind)))))
-         :callable-kinds (Map/put kinds namespace (Enum/reduce bindings prior-kinds
-           (fn [binding out] (Map/put out binding (sdk_callable_kind (stage-head form)))))))))))
+  (let [context (constructor_context)
+        declarations (if context (Map/get context :declarations {})
+                         (Process/get :bl_sdk_stage_declarations {}))
+        private? (sdk_checked_private? form)
+        names (Map/get declarations namespace {})
+        kinds (Map/get declarations :callable-kinds {})
+        prior-kinds (Map/get kinds namespace {})
+        updated (Map/put (Map/put declarations namespace
+                  (Enum/reduce bindings names
+                    (fn [binding out] (Map/put out binding (if private? :private kind)))))
+                  :callable-kinds (Map/put kinds namespace (Enum/reduce bindings prior-kinds
+                    (fn [binding out] (Map/put out binding (sdk_callable_kind (stage-head form)))))))]
+    (if context (constructor_context_put! :declarations updated)
+      (Process/put :bl_sdk_stage_declarations updated))))
 
 (defn- constructor_record_definition! [form namespace]
  (when-let [context (constructor_context)]

@@ -8,6 +8,8 @@ import argparse
 import json
 import os
 from pathlib import Path
+import signal
+import shutil
 import statistics
 import subprocess
 import tempfile
@@ -16,19 +18,26 @@ import time
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('drop', type=Path)
 parser.add_argument('--samples', type=int, default=3)
+parser.add_argument('--runtime-regressions', action='store_true',
+                    help='exercise SDK lifecycle, metadata, cache and packaging from the sealed drop')
+parser.add_argument('--max-seconds', type=float,
+                    help='fail if any fresh install or cold VM exceeds this wall-clock budget')
 args = parser.parse_args()
 artifact = args.drop.resolve()
 if args.samples < 1:
     parser.error('--samples must be positive')
+if args.max_seconds is not None and args.max_seconds <= 0:
+    parser.error('--max-seconds must be positive')
 
 
-def run(command, cwd, env, expected='42'):
+def run(command, cwd, env, expected='42', timeout=180):
     start = time.monotonic()
     result = subprocess.run(command, cwd=cwd, env=env, text=True,
-                            capture_output=True, timeout=180)
+                            capture_output=True, timeout=timeout)
     if result.returncode:
         raise RuntimeError(result.stdout + result.stderr)
-    assert expected in result.stdout.splitlines(), result.stdout
+    if expected is not None:
+        assert expected in result.stdout.splitlines(), result.stdout
     return time.monotonic() - start, result.stdout
 
 
@@ -37,6 +46,7 @@ temporary_parent.mkdir(exist_ok=True)
 with tempfile.TemporaryDirectory(prefix='bl-drop-startup-', dir=temporary_parent) as temporary:
     scratch = Path(temporary)
     times = []
+    cold_vm_times = []
     for sample in range(args.samples):
         directory = scratch / str(sample)
         directory.mkdir()
@@ -56,6 +66,22 @@ with tempfile.TemporaryDirectory(prefix='bl-drop-startup-', dir=temporary_parent
         elapsed, _ = run([str(artifact), '--cold', 'run', str(hello)], directory, env)
         times.append(round(elapsed, 3))
         print(f'fresh-install-{sample + 1}: {elapsed:.3f}s', flush=True)
+        # Reuse only extracted files: --cold still starts a new BEAM. This
+        # separates VM readiness from the first install's decompression work.
+        elapsed, _ = run([str(artifact), '--cold', 'run', str(hello)], directory, env)
+        cold_vm_times.append(round(elapsed, 3))
+        print(f'cold-vm-{sample + 1}: {elapsed:.3f}s', flush=True)
+
+    # A source checkout in the caller's cwd must not become this installed
+    # runtime's compiler. Shadow all host inputs and edit one byte without
+    # changing the selected executable, its environment, or its shipped files.
+    shadow = directory / 'foreign-checkout'
+    source_hosts = Path(__file__).resolve().parents[2] / 'priv/host'
+    shutil.copytree(source_hosts, shadow / 'priv/host')
+    host = shadow / 'priv/host/server.bl'
+    host.write_bytes(host.read_bytes() + b'\n; foreign checkout compiler input\n')
+    elapsed, _ = run([str(artifact), '--cold', 'eval', '(println (+ 40 2))'], shadow, env)
+    print(f'foreign-checkout-startup: {elapsed:.3f}s', flush=True)
 
     # Instrument the extracted image before the actual release entry starts
     # the app. Counting calls avoids a trace mailbox and its timing overhead.
@@ -86,8 +112,58 @@ BeamLisp.Launcher.start_app!(["run", Path.join(__DIR__, "hello.bl")], %{halt: ha
     command.append(str(probe))
     _, output = run(command, directory, env)
     print(next(line for line in output.splitlines() if line.startswith('STARTUP-AOT ')), flush=True)
+
+    # The first default command must already run in the persistent VM. A
+    # background start plus a temporary cold command would discard that state.
+    (directory / 'env.bl').write_text('{:name "drop-startup-transport" :paths []}')
+    owners = []
+    default_times = []
+    try:
+        for _ in range(2):
+            start = time.monotonic()
+            result = subprocess.run(
+                [str(artifact), 'eval', '(println (str "OWNER " (System/pid)))'],
+                cwd=directory, env=env, text=True, capture_output=True, timeout=180)
+            if result.returncode:
+                # Keep the actual startup cause in CI output before the private
+                # fixture is removed. A readiness timeout alone hides whether
+                # the child failed to bind, load, or initialize its session.
+                for log in sorted((directory / 'state').rglob('*.log')):
+                    print(f'FAILED WARM START {log.relative_to(directory)}:\n'
+                          + log.read_text(errors='replace')[-12000:], flush=True)
+            assert result.returncode == 0, result.stdout + result.stderr
+            owner = int(next(line[6:] for line in result.stdout.splitlines()
+                             if line.startswith('OWNER ')))
+            owners.append(owner)
+            default_times.append(round(time.monotonic() - start, 3))
+            os.kill(owner, 0)  # A temporary command VM would already have exited.
+        assert owners[0] == owners[1], 'default commands discarded the first VM'
+        print(json.dumps({'default_request_seconds': default_times,
+                          'first_request_reused_runtime': True}), flush=True)
+    finally:
+        # Limit cleanup to this fixture's exact private runtime directory,
+        # including a daemon whose first request failed before returning a pid.
+        try:
+            subprocess.run([str(artifact), 'realm', 'stop'], cwd=directory, env=env,
+                           capture_output=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            for owner in set(owners):
+                try:
+                    os.kill(owner, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        marker = f'XDG_RUNTIME_DIR={env["XDG_RUNTIME_DIR"]}'.encode() + b'\0'
+        for proc in (Path('/proc').iterdir() if Path('/proc').exists() else []):
+            if proc.name.isdigit():
+                try:
+                    if marker in (proc / 'environ').read_bytes() and b'BeamLisp' in (proc / 'cmdline').read_bytes():
+                        os.kill(int(proc.name), signal.SIGTERM)
+                except (FileNotFoundError, ProcessLookupError, PermissionError):
+                    pass
     print(json.dumps({'fresh_install_seconds': times,
-                      'median_seconds': statistics.median(times)}), flush=True)
+                      'median_seconds': statistics.median(times),
+                      'cold_vm_seconds': cold_vm_times,
+                      'cold_vm_median_seconds': statistics.median(cold_vm_times)}), flush=True)
 
     # Loading precompiled code and authenticating it for an actor's lifetime
     # are separate contracts. The release must ship BOTH compiler products;
@@ -97,3 +173,28 @@ BeamLisp.Launcher.start_app!(["run", Path.join(__DIR__, "hello.bl")], %{halt: ha
     elapsed, _ = run([str(artifact), '--cold', 'run', str(retention)], directory, env,
                      expected='PACKAGED_SDK_RETENTION_READY')
     print(f'packaged-sdk-retention: {elapsed:.3f}s', flush=True)
+
+    if args.runtime_regressions:
+        # Test inputs are copied; runtime sources and artifacts come only from
+        # the sealed image. No checkout, staging path or compiler overlay is on
+        # the consumer's search path.
+        source = Path(__file__).resolve().parents[1] / 'bl'
+        regressions = ['sdk_loading_batch_test.bl', 'sdk_image_metadata_test.bl', 'sdk_inventory_cache_test.bl',
+                       'sdk_retention_lock_test.bl', 'code_lease_observation_test.bl',
+                       'proc_framework_test.bl',
+                       'application_package_sdk_test.bl', 'aot_actor_inventory_test.bl']
+        tests = directory / 'regressions'
+        tests.mkdir()
+        for name in regressions:
+            (tests / name).write_bytes((source / name).read_bytes())
+        elapsed, output = run([str(artifact), '--cold', 'test',
+                               *[str(tests / name) for name in regressions]],
+                              directory, env, expected=None, timeout=600)
+        summary = f'{len(regressions)} file(s) passed, 0 failed, 0 incoherent'
+        assert summary in [line.strip() for line in output.splitlines()], output
+        print(output, end='', flush=True)
+        print(f'sealed-runtime-regressions: {elapsed:.3f}s', flush=True)
+
+    if args.max_seconds is not None:
+        assert max(times + cold_vm_times) <= args.max_seconds, (times, cold_vm_times, args.max_seconds)
+        assert default_times[0] <= args.max_seconds, (default_times, args.max_seconds)

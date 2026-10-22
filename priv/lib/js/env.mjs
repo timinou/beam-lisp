@@ -93,6 +93,7 @@ const varRow = (n, s) => key(T(n, s));
 const linkRow = (n, s) => key(T(kw("link"), n, s));
 
 export const ENV = {
+  env_id: () => R.list(R.kw("global")),
   current_ns: () => CURRENT_NS,
   in_ns: (ns) => { CURRENT_NS = ns; putKey(T(kw("ns"), ns), true); return OK; },
   declare_ns: (ns) => putKey(T(kw("ns"), ns), true),
@@ -149,6 +150,13 @@ export const ENV = {
   },
   // a JS page has no capability table: every op is allowed, `caps` is :all
   caps: () => kw("all"),
+  // Shared rt.bl contains optional BEAM Source hooks behind function_exported,
+  // which is false on this target. Keep their leaf identities resolvable while
+  // refusing direct use; a browser has no native Source custody or admission.
+  "check_source_callable!": (value) => { throw new BLError("BEAM Source execution is unavailable on the JavaScript target"); },
+  "check_source_invocation!": (value, args) => { throw new BLError("BEAM Source execution is unavailable on the JavaScript target"); },
+  "check_source_invocation1!": (value, arg) => { throw new BLError("BEAM Source execution is unavailable on the JavaScript target"); },
+  "check_source_invocation2!": (value, left, right) => { throw new BLError("BEAM Source execution is unavailable on the JavaScript target"); },
   // Shared rt.bl can reference the BEAM command-environment seam. A browser
   // has no OS environment or subprocess host; never fall through to globals.
   os_env_call: (fun, args) => { throw new BLError("System/" + (fun.fq ?? fun) + " is unavailable on the JavaScript target"); },

@@ -162,6 +162,7 @@
     :Elixir.BeamLisp.NamespaceInterface
     :Elixir.BeamLisp.BuildPlan
     :Elixir.BeamLisp.Record
+    :Elixir.BeamLisp.Server
     :Elixir.BeamLisp.Emit
     :Elixir.BeamLisp.Optimize
     :Elixir.BeamLisp.Link
@@ -186,6 +187,7 @@
     (erlang/== mod :Elixir.BeamLisp.Optimize) "optimize.bl"
     (erlang/== mod :Elixir.BeamLisp.Link) "link.bl"
     (erlang/== mod :Elixir.BeamLisp.Record) "record.bl"
+    (erlang/== mod :Elixir.BeamLisp.Server) "server.bl"
     (erlang/== mod :Elixir.BeamLisp.Tiers) "tiers.bl"
     :else nil))
 ; AOTCache is NOT in `pinned_host_source/1` or `codegen_modules/0`, because it
@@ -202,6 +204,26 @@
       (erlang/apply :Elixir.System :get_env (lst key)))))
 
 ; ── whether the cache participates ─────────────────────────────────────────
+
+(defn read_source_parts
+  "Read a content-addressed pure planner frame. Driver and runtime freshness
+   share this decoder; corrupt/incompatible optional data is a cache miss."
+  [path hash]
+  (try
+    (let [read (File/read path)]
+      (if (erlang/=/= :ok (erlang/element 1 read)) nil
+        (let [frame (erlang/element 2 read)]
+          (if (or (erlang/< (erlang/byte_size frame) 32)
+                  (erlang/> (erlang/byte_size frame) 8388608)) nil
+            (let [split (erlang/split_binary frame 32)
+                  payload (erlang/element 2 split)]
+              (if (erlang/=/= (erlang/element 1 split) (crypto/hash :sha256 payload)) nil
+                (let [parts (erlang/binary_to_term payload (lst :safe))]
+                  (if (and (erlang/is_map parts)
+                           (erlang/== (maps/get :hash parts nil) (binary/encode_hex hash))
+                           (lists/all (fn [field] (maps/is_key field parts))
+                             (lst :macros :iface :inames :refs :headers))) parts nil))))))))
+    (catch _ nil)))
 
 (defn enabled?
   "Whether the cache participates in compilation. Default on."
@@ -444,14 +466,14 @@
 
 (defn- codegen_source_roots
   "Where the codegen sources live, in order of authority: the checkout's `lib/`
-   (anchored on `BL_ROOT`, which the launcher exports, and falling back to the
-   process working directory — a `.bl` source has no `__DIR__`; see the header),
+   (anchored on `BL_ROOT`, which the checkout launcher exports, and otherwise
+   the running application's root),
    then `lib/` beside the app's `priv/`. The `.ex` modules and the pinned
    `priv/host/*.bl` leaves are resolved beside these. A root that does not exist
    simply loses the `File.exists?` race and the next is tried."
   []
   (let [anchor (let [r (erlang/apply :Elixir.System :get_env (lst "BL_ROOT"))]
-                 (cond (erlang/== r nil) (System/cwd) :else r))]
+                 (cond (erlang/== r nil) (Path/dirname (BeamLisp.Tiers/priv_root)) :else r))]
     (lst (Path/expand (Path/join anchor "lib"))
          (Path/join (Path/dirname (BeamLisp.Tiers/priv_root)) "lib"))))
 
@@ -562,15 +584,64 @@
     (Enum/reduce (Map/get deps path '()) (MapSet/put seen path)
       (fn [dep acc] (closure_walk dep deps acc)))))
 
+(defn- generation_lock_path [root key]
+  (Path/join (Path/join root ".leases") key))
+
+(defn- with_file_lock [path shared action remaining]
+  (BeamLisp.LazyMemo/ensure_loaded!)
+  (let [r (BeamLisp.LazyMemo/nif_file_lock path shared true)]
+    (if (erlang/== :ok (erlang/element 1 r))
+      (try (erlang/apply action (lst)) (finally (BeamLisp.LazyMemo/nif_file_unlock (erlang/element 2 r))))
+      (if (erlang/> remaining 0)
+        (do (Process/sleep 10) (with_file_lock path shared action (erlang/- remaining 1)))
+        (erlang/error :cache_generation_busy)))))
+
+(defn- retain_vm_generation [root key]
+  (let [slot (tup root key) table (tup :Elixir.BeamLisp.AOTCache :generation_leases)
+        slots (persistent_term/get table (Map/new))]
+    (if (Map/has_key? slots slot) true
+      (if (erlang/not (or (erlang/== key (compiler_key)) (erlang/== key (build_key)))) false
+        (global/trans (tup table (erlang/self))
+          (fn []
+            (let [current (persistent_term/get table (Map/new))]
+              (if (Map/has_key? current slot) true
+                (if (erlang/>= (erlang/map_size current) 128) false
+                  (do
+                    (BeamLisp.LazyMemo/ensure_loaded!)
+                    ;; A VM lease has no process monitor. Persistent_term owns
+                    ;; its resource; only VM exit ends the active generation.
+                    (let [r (BeamLisp.LazyMemo/nif_file_lock (generation_lock_path root key) true false)]
+                      (if (erlang/== :ok (erlang/element 1 r))
+                        (do (persistent_term/put table (Map/put current slot (erlang/element 2 r))) true)
+                        false)))))))
+          (lst (erlang/node)))))))
+
+(defn with_generation
+  "Running compiler/build generations retain shared OS custody for the VM's
+   lifetime, including idle time between requests. Other generations hold it
+   for this operation only. GC requires exclusive custody of the same anchor.
+   At most 128 VM roots/generations are retained; saturated roots still protect
+   each operation. No persistent handler belongs to a short-lived worker."
+  [key action]
+  ;; Optional cache reads at standalone preboot cannot load the memo runtime
+  ;; (whose ordinary API assumes the language exists). A live compiler already
+  ;; owns the mandatory native runtime; other callers get an explicit refusal.
+  (when (erlang/not (erlang/function_exported :Elixir.BeamLisp.LazyMemo :nif_file_lock 3))
+    (erlang/error :cache_native_runtime_not_ready))
+  (let [root (Path/expand (dir))]
+    (writable_entry_dir key "custody")
+    (if (retain_vm_generation root key) (erlang/apply action (lst))
+      (with_file_lock (generation_lock_path root key) true action 500))))
+
 ; ── the cache entry: fetch, store, validate ────────────────────────────────
 
-(defn fetch
+(defn- fetch_unlocked
   "Link a cached entry's beams into `compile_path`. Returns `{:ok, modules}`
    when the entry existed and every beam materialised, `:miss` otherwise (absent
    entry, or any link/copy failure — the caller compiles instead). The four-arg
    form separates a context-specific cache address from actual source provenance."
   ([compiler_key closure_key compile_path]
-   (fetch compiler_key closure_key compile_path closure_key))
+   (fetch_unlocked compiler_key closure_key compile_path closure_key))
   ([compiler_key cache_key compile_path source_key]
   (let [entry (entry_dir compiler_key cache_key)
         modules (valid_keyed_entry entry compiler_key source_key)]
@@ -581,14 +652,78 @@
         (erlang/== :ok (link_beams entry compile_path modules)) (tup :ok modules)
         :else :miss)))))
 
-(defn store
+(defn fetch
+  ([key closure out] (fetch key closure out closure))
+  ([key cache out source]
+   (writable_entry_dir key cache)
+   (try (with_generation key (fn [] (fetch_unlocked key cache out source)))
+        (catch _ :miss))))
+
+(defn- prepare_fetch_unlocked
+  "Capture a complete verified cache unit without loading code, initializing
+   namespaces or changing the destination. Reads and validation need no build
+   publication lock. A captured unit remains usable if cache GC removes it."
+  [compiler_key closure_key]
+  (try
+    (let [entry (entry_dir compiler_key closure_key)
+          modules (valid_keyed_entry entry compiler_key closure_key)]
+      (when modules
+        (let [manifest (safe_term (File/read! (Path/join entry "manifest.term")))
+              beams (Enum/map modules (fn [mod]
+                      (tup mod (File/read! (Path/join entry (beam_file mod))))))]
+          (when (Enum/all? beams (fn [beam]
+                  (and (erlang/== (Map/get (Map/get manifest :digests) (erlang/element 1 beam))
+                                  (crypto/hash :sha256 (erlang/element 2 beam)))
+                       (cached_bytes_match? (erlang/element 1 beam) (erlang/element 2 beam)
+                                            compiler_key closure_key))))
+            (Map/new (lst (tup :modules modules) (tup :beams beams)))))))
+    (catch _ nil)))
+
+(defn prepare_fetch [key closure]
+  (try (with_generation key (fn [] (prepare_fetch_unlocked key closure)))
+       (catch _ nil)))
+
+(defn prepared_replay_complete?
+  "Compiler-produced coverage of every top-level form, carried by the actual
+   verified forwarder. An arbitrary effect or incomplete expansion has no witness."
+  [prepared]
+  (Enum/any? (Map/get prepared :beams)
+    (fn [beam]
+      (let [r (beam_lib/chunks (erlang/element 2 beam) (lst :attributes))
+            attrs (Keyword/get (erlang/element 2 (erlang/element 2 r)) :attributes)
+            role (Keyword/get attrs :bl_aot_artifact_role)
+            proof (Keyword/get attrs :bl_aot_replay_complete)]
+        (and (or (erlang/== role :mutable-forwarder) (erlang/== role (lst :mutable-forwarder)))
+             (or (erlang/== proof true) (erlang/== proof (lst true))))))))
+
+(defn output_replay_complete? [modules compile_path]
+  (prepared_replay_complete?
+    (Map/new (lst (tup :beams (Enum/map modules (fn [mod]
+      (tup mod (File/read! (Path/join compile_path (beam_file mod)))))))))))
+
+(defn restore_prepared
+  "Materialize captured artifacts only. Initializers belong to the loader's
+   first semantic use of a dependency, never to packaging/cache restoration."
+  [prepared compile_path]
+  (File/mkdir_p! compile_path)
+  (Enum/each (Map/get prepared :beams)
+    (fn [beam]
+      (let [path (Path/join compile_path (beam_file (erlang/element 1 beam)))
+            tmp (temp_path path)]
+        (try
+          (File/write! tmp (erlang/element 2 beam))
+          (File/rename! tmp path)
+          (finally (File/rm tmp))))))
+  (Map/get prepared :modules))
+
+(defn- store_unlocked
   "Publish the beams for `modules` (already in `compile_path`) under the given
    keys. Atomic via temp-dir + rename; failures are ignored. The manifest is
    `%{version: 2, modules: modules, digests: digests}` — the SAME layout the
    recalled module wrote, so entries are interchangeable in both directions.
    The five-arg form validates source_key while publishing under cache_key."
   ([compiler_key closure_key compile_path modules]
-   (store compiler_key closure_key compile_path modules closure_key))
+   (store_unlocked compiler_key closure_key compile_path modules closure_key))
   ([compiler_key cache_key compile_path modules source_key]
   (let [final (writable_entry_dir compiler_key cache_key)
         tmp (temp_path final)]
@@ -612,15 +747,24 @@
         (cond
           (erlang/== nil (valid_keyed_entry tmp compiler_key source_key)) (File/rm_rf! tmp)
           :else
-          (global/trans (tup (tup (toolchain_key_pt) :publish final) (erlang/self))
+          (with_file_lock (Path/join (Path/join (Path/join (dir) ".entries") compiler_key) cache_key) false
           (fn []
             (cond
               (erlang/not (erlang/== nil (valid_keyed_entry final compiler_key source_key))) (File/rm_rf! tmp)
               :else (do (File/rm_rf! final) (File/rename! tmp final))))
-          (lst (erlang/node))))
-        (maybe_cleanup_obsolete_generations compiler_key)
+          500))
         :ok)
       (catch _e (do (File/rm_rf tmp) :ok))))))
+
+(defn store
+  ([key closure out modules] (store key closure out modules closure))
+  ([key cache out modules source]
+   (writable_entry_dir key cache)
+   (try
+     (with_generation key (fn [] (store_unlocked key cache out modules source)))
+     (maybe_cleanup_obsolete_generations key)
+     :ok
+     (catch _ :ok))))
 
 (defn- valid_entry
   "The module list of a COMPLETE entry, or nil. A manifest is trusted only when
@@ -682,25 +826,24 @@
          (let [tier (BeamLisp.Tiers/tier_of_ns ns)]
            (or (erlang/== tier :boot) (erlang/== tier :build))))))
 
-(defn- cached_module_matches?
-  [entry mod compiler_key closure_key]
-  (cond
-    ; Native and generic cache clients retain their digest-only contract.
-    (erlang/not (String/starts_with? (Atom/to_string mod) "Elixir.BeamLisp.Ns.")) true
-    :else
-    (try
-      (let [path (Path/join entry (beam_file mod))
-            r (beam_lib/chunks (String/to_charlist path) (lst :exports :attributes))]
-        (cond
-          (erlang/not (erlang/== :ok (erlang/element 1 r))) false
-          :else
-          (let [chunks (erlang/element 2 (erlang/element 2 r))
-                exports (Keyword/get chunks :exports)]
-            (cond
-              (Enum/member? exports (tup :__bl_ns_defs__ 0))
-              (provenance_attributes_match? (Keyword/get chunks :attributes) compiler_key closure_key)
-              :else true))))
-      (catch _e false))))
+(defn- cached_bytes_match? [mod bytes compiler_key closure_key]
+  (if (erlang/not (String/starts_with? (Atom/to_string mod) "Elixir.BeamLisp.Ns.")) true
+   (try
+    (let [r (beam_lib/chunks bytes (lst :exports :attributes))
+          _ (when-not (and (erlang/== :ok (erlang/element 1 r))
+                           (erlang/== mod (erlang/element 1 (erlang/element 2 r))))
+              (erlang/error :cached_module_identity_changed))
+          chunks (erlang/element 2 (erlang/element 2 r))]
+      (if (and (String/starts_with? (Atom/to_string mod) "Elixir.BeamLisp.Ns.")
+               (Enum/member? (Keyword/get chunks :exports) (tup :__bl_ns_defs__ 0)))
+        (provenance_attributes_match? (Keyword/get chunks :attributes) compiler_key closure_key)
+        true))
+    (catch _ false))))
+
+(defn- cached_module_matches? [entry mod compiler_key closure_key]
+  (if (erlang/not (String/starts_with? (Atom/to_string mod) "Elixir.BeamLisp.Ns.")) true
+    (try (cached_bytes_match? mod (File/read! (Path/join entry (beam_file mod))) compiler_key closure_key)
+         (catch _ false))))
 
 (defn- valid_keyed_entry
   [entry compiler_key closure_key]
@@ -757,13 +900,24 @@
            (tup :ok '())
            :else (tup :error (erlang/element 2 listed)))
          :else
-         (let [entries (erlang/element 2 listed)
+         (let [sdk-root (Path/join root "sdk-build")
+               sdk-safe (erlang/not (erlang/== (lst) (generation_info root "sdk-build")))
+               sdk-listed (if sdk-safe (File/ls sdk-root) (tup :ok (lst)))
+               entries (Enum/uniq (erlang/++ (erlang/element 2 listed)
+                          (if (erlang/== :ok (erlang/element 1 sdk-listed))
+                            (erlang/element 2 sdk-listed) (lst))))
                generations (Enum/sort_by
                              (Enum/flat_map
                                (Enum/reject
                                  (Enum/filter entries (fn [n] (valid_compiler_key? n)))
                                  (fn [n] (erlang/== n active_key)))
-                               (fn [n] (generation_info root n)))
+                               (fn [n]
+                                 (let [parts (erlang/++ (generation_info root n)
+                                              (if sdk-safe (generation_info sdk-root n) (lst)))]
+                                   (if (erlang/== (lst) parts) (lst)
+                                     (lst (Map/new (lst (tup :name n)
+                                       (tup :paths (Enum/map parts (fn [g] (Map/get g :path))))
+                                       (tup :mtime (Enum/max (Enum/map parts (fn [g] (Map/get g :mtime))))))))))))
                              (fn [g] (Map/get g :mtime))
                              :desc)
                now (System/os_time :second)
@@ -782,11 +936,19 @@
                             (Keyword/get options :max_delete))
                deleted (Enum/flat_map candidates
                          (fn [g]
-                           (let [rr (File/rm_rf (Map/get g :path))]
-                             (cond
-                               (and (erlang/is_tuple rr) (erlang/== :ok (erlang/element 1 rr)))
-                               (lst (Map/get g :name))
-                               :else '()))))]
+                           (BeamLisp.LazyMemo/ensure_loaded!)
+                           (let [r (BeamLisp.LazyMemo/nif_file_lock
+                                     (generation_lock_path root (Map/get g :name)) false true)]
+                             (if (erlang/== :ok (erlang/element 1 r))
+                               (try
+                                 (let [results (Enum/map (erlang/++ (Map/get g :paths)
+                                                    (if (erlang/== (lst) (generation_info root ".entries")) (lst)
+                                                      (lst (Path/join (Path/join root ".entries") (Map/get g :name)))))
+                                                (fn [path] (File/rm_rf path)))]
+                                   (if (Enum/all? results (fn [rr] (erlang/== :ok (erlang/element 1 rr))))
+                                     (lst (Map/get g :name)) (lst)))
+                                 (finally (BeamLisp.LazyMemo/nif_file_unlock (erlang/element 2 r))))
+                               (lst)))))]
            (tup :ok deleted))))
      (catch _e (tup :ok '())))))
 
@@ -795,29 +957,41 @@
   []
   (persistent_term/erase (gc_last_sweep_pt)))
 
+(defn- cleanup_due?
+  "Throttle independently per physical cache root. A worker's request-local
+   environment chooses the root; interleaving projects must not reset it."
+  [root now interval]
+  (let [slots (persistent_term/get (gc_last_sweep_pt) (Map/new))
+        last (if (erlang/is_map slots) (Map/get slots root) nil)]
+    (or (erlang/== nil last) (erlang/>= (erlang/- now last) interval))))
+
 (defn- maybe_cleanup_obsolete_generations
-  "Sweep obsolete generations, at most once per `:interval_ms`, serialized on a
-   global lock so parallel build workers share one sweep budget — a cold wave
-   cannot multiply `max_delete` by its worker count."
+  "Warm stores do not take a global lock. Due stores recheck under a local
+   per-root lock, sharing one sweep budget across all workers in this VM.
+   Slot publication uses a separate short lock, so unrelated roots can sweep
+   independently without losing each other's throttle timestamps."
   [active_key]
-  (global/trans (tup (gc_last_sweep_pt) (erlang/self))
-    (fn []
-      (let [options (gc_options '())
-            now (System/monotonic_time :millisecond)
-            root (dir)
-            last (persistent_term/get (gc_last_sweep_pt) nil)
-            due (cond
-                  (and (erlang/is_tuple last)
-                       (erlang/== 2 (erlang/tuple_size last))
-                       (erlang/== root (erlang/element 1 last)))
-                  (erlang/>= (erlang/- now (erlang/element 2 last))
-                             (Keyword/get options :interval_ms))
-                  :else true)]
-        (cond
-          due (do
-                (persistent_term/put (gc_last_sweep_pt) (tup root now))
-                (cleanup_obsolete_generations active_key options))
-          :else :ok))))
+  (let [options (gc_options '()) root (Path/expand (dir))
+        interval (Keyword/get options :interval_ms)]
+    (when (cleanup_due? root (System/monotonic_time :millisecond) interval)
+      (global/trans (tup (tup (gc_last_sweep_pt) root) (erlang/self))
+        (fn []
+          (let [now (System/monotonic_time :millisecond)]
+            (when (cleanup_due? root now interval)
+              (let [admitted (global/trans (tup (gc_last_sweep_pt) (erlang/self))
+                               (fn []
+                                 (let [prior (persistent_term/get (gc_last_sweep_pt) (Map/new))
+                                       slots (if (erlang/is_map prior) prior (Map/new))]
+                                   ;; Bound retained roots without evicting a
+                                   ;; live throttle and multiplying its budget.
+                                   ;; Saturation declines optional cleanup.
+                                   (if (or (Map/has_key? slots root)
+                                           (erlang/< (erlang/map_size slots) 128))
+                                     (do (persistent_term/put (gc_last_sweep_pt) (Map/put slots root now)) true)
+                                     false)))
+                               (lst (erlang/node)))]
+                (when (erlang/== true admitted) (cleanup_obsolete_generations active_key options))))))
+        (lst (erlang/node)))))
   :ok)
 
 (defn- gc_options

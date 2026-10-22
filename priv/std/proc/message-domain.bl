@@ -3,7 +3,8 @@
 ; state/reply validity, migration totality outside the old domain or authority.
 (ns proc.message-domain
  (:require [system.ir :as ir] [system.publication :as publication]
-           [data.first-order :as data]))
+           [data.first-order :as data] [reload.source-producer :as producer]
+           [reload.native-call :as native-call]))
 (def MAX-NODES 32768)
 (def MAX-HELPERS 32)
 (def MAX-BRANCHES 32)
@@ -30,7 +31,7 @@
  ;; admits an uninitialized provider, an arbitrary module prefix or mutable Var.
  (if (contains? (:kernels state #{}) module) state
   (do
-   (when-not (and (contains? #{:Elixir.BeamLisp.Ns.Rt :Elixir.BeamLisp.Ns.Core :Elixir.BeamLisp.Num} module)
+   (when-not (and (contains? #{:Elixir.BeamLisp.Ns.Rt :Elixir.BeamLisp.Ns.Core :Elixir.BeamLisp.Num :Elixir.BeamLisp.Set} module)
                   (erlang/module_loaded module) (BeamLisp.AOT/seed_dependency! module))
     (refuse :unattested-message-kernel))
    (update (stamp state module) :kernels (fn [all] (conj (or all #{}) module))))))
@@ -90,7 +91,8 @@
 (defn- choose [test then else]
  (cond
   (literal? test) (if (contains? #{false nil} (:value test)) else then)
-  (and (boolean-term? test) (boolean-term? then) (= (lit false) else))
+  (and (boolean-term? test) (boolean-term? then)
+       (or (= (lit false) else) (= test else)))
    {:tag :and :terms [test then]}
   (and (boolean-term? test) (= test then) (boolean-term? else))
    {:tag :or :terms [test else]}
@@ -108,7 +110,7 @@
    {:tag :cmp :operator kind :left a :right b})))
 (defn- primitive [state module function args]
  (do
- (when-not (and (contains? #{:erlang :maps :Elixir.BeamLisp.Ns.Rt :Elixir.BeamLisp.Num} module)
+ (when-not (and (contains? #{:erlang :maps :Elixir.BeamLisp.Ns.Rt :Elixir.BeamLisp.Num :Elixir.BeamLisp.Set} module)
                 (erlang/module_loaded module)) (refuse :unknown-message-operation))
  (let [arity (count args) pair [module function] a (first args) b (second args)
        rt? (= module :Elixir.BeamLisp.Ns.Rt)
@@ -151,6 +153,8 @@
    (and (= module :maps) (= function :get) (contains? #{2 3} arity))
     ;; maps:get/2 may raise for missing keys; don't silently model it as get/3.
     (if (= arity 3) [(require-domain state b :raw-map) (field b a (nth args 2) :native)] (refuse :partial-native-message-lookup))
+   (and rt? (= :hash_key function) (= arity 1) (literal? a) (message-key? (:value a)))
+    [state a]
    (and rt? (contains? #{:assoc :coll-assoc} function) (= arity 3)) [state (assoc-term a b (nth args 2))]
    (and (= module :maps) (= function :put) (= arity 3)) [state (assoc-term (nth args 2) a b)]
    (and (= module :maps) (= function :remove) (= arity 2)) [state (remove-term b a)]
@@ -161,6 +165,10 @@
     [(require-domain state a :raw-number) (comparison :> a (lit 0))]
    (and (= pair [:erlang :is_map_key]) (= arity 2) (literal? a))
     [(require-domain state b :raw-map) {:tag :key? :target b :key (:value a)}]
+   (and (= pair [:Elixir.BeamLisp.Set :new]) (= arity 1)
+        (literal? a) (erlang/is_list (:value a)) (<= (count (:value a)) MAX-BRANCHES)
+        (every? scalar? (:value a)))
+    [(kernel state module) (lit (BeamLisp.Set/new (:value a)))]
    (and rt? (contains? #{:contains? :coll-contains?} function) (= arity 2)
         (literal? a) (set? (:value a)) (<= (count (:value a)) MAX-BRANCHES)
         (every? scalar? (:value a)))
@@ -218,12 +226,25 @@
       (primitive state (:mod site) (:fun site) values))
     :else (refuse :dynamic-message-call)))))
 (defn lift [state environment node]
- (let [state (tick state)]
+ (let [state (tick state)
+       ;; Snapshot/callback provenance is checked before lifting. Analyze the
+       ;; actual executable call beneath compiler-owned Source restrictions;
+       ;; this proof still grants no execution, callback or native authority.
+       node (producer/analysis-node node)]
   (when-not (ir/node? node) (refuse :unknown-message-ir))
   (case (:op node)
    :lit (do (data/check! (:val node) {:max-nodes 16384 :max-bytes 1048576 :max-depth 64})
             [state (lit (:val node))])
    :enil [state (lit ())]
+   :cons
+    (let [[state head] (lift state environment (:head node))
+          [state tail] (lift state environment (:tail node))]
+     ;; Reconstruct only bounded proper literal lists, never a lazy sequence,
+     ;; protocol value or arbitrary constructor. Set literals use this ABI.
+     (when-not (and (literal? head) (literal? tail) (erlang/is_list (:value tail))
+                    (< (count (:value tail)) MAX-BRANCHES))
+      (refuse :unproved-message-literal-list))
+     [state (lit (cons (:value head) (:value tail)))])
    :var (if (contains? environment (:name node)) [state (get environment (:name node))]
           (refuse :free-message-variable))
    :let (let [[after value] (lift state environment (:init node))]
@@ -250,16 +271,31 @@
    :remote (call state environment node)
    :apply (call state environment node)
    (refuse :unsupported-message-ir))))
-(defn capture
+(defn- with-environment [environment action]
+ (let [environment (if (map? environment) environment (BeamLisp.Env/resolve_native_context! environment))]
+ ;; A captured public context is not executable custody. Even readonly proof
+ ;; helpers require a live, attested graph lease before selecting that context.
+ (let [enter (fn []
+              (let [previous (BeamLisp.Env/capture)]
+               (try (BeamLisp.Env/bind environment) (action)
+                (finally (BeamLisp.Env/bind previous)))))]
+  (if-let [graph (:generation environment)]
+   (do
+    (BeamLisp.Loader/ensure_loaded "reload.generation")
+    (let [with! (BeamLisp.Env/sdk_callable! "reload.generation" "with!" 2)]
+     (with! graph enter)))
+   (enter)))))
+
+(defn- capture-once
  "Capture a single exact named published arity-one callback, without invoking
   it. Anonymous/captured/higher-order/dynamic/effectful bodies decline. Metadata
   and native identities are private bounded evidence, never adoption authority."
  [callback environment]
- (let [previous (BeamLisp.Env/capture)]
-  (try
-   (BeamLisp.Env/bind environment)
-   (let [native (native-function callback) graph (:generation environment)
-         namespaces (vec (distinct (concat (vals (:mapping graph)) [(:ns environment) "core" "sugar"])))
+ (with-environment environment
+  (fn []
+   (try
+   (let [native (native-function callback) graph (Process/get :bl_generation)
+         namespaces (vec (distinct (concat (vals (:mapping graph)) [(BeamLisp.Env/current_ns) "core" "sugar"])))
          home (when native (first (filter #(and (string? %) (= (first native) (BeamLisp.Emit/module_for %))) namespaces)))
          state {:nodes 0 :stack #{} :definitions {} :modules {} :bindings {} :obligations [] :namespaces namespaces}]
     (when-not (and native home (= 1 (nth native 2))) (refuse :unpublished-message-callback))
@@ -271,8 +307,19 @@
       (refuse :unstable-message-callback))
      {:status :proved :expression expression :definitions (:definitions after) :modules (:modules after)
       :bindings (:bindings after) :obligations (:obligations after) :environment environment :root native}))
-   (catch error {:status :unknown :reason (or (:reason (ex-data error)) :message-proof-unavailable)})
-   (finally (BeamLisp.Env/bind previous)))))
+   (catch error
+    (if-let [reason (:reason (ex-data error))]
+     {:status :unknown :reason reason} (throw error)))
+   ))))
+
+(defn capture
+ "Capture actual published metadata under its native lifetime. A first cold
+  dependency admission may change the publication epoch; retry that read once.
+  No application callback or factory is evaluated by either attempt."
+ [callback environment]
+ (let [result (capture-once callback environment)]
+  (if (= :unstable-message-callback (:reason result))
+   (capture-once callback environment) result)))
 
 (declare substitute prove disprove)
 (defn- literal-type [value]
@@ -404,9 +451,8 @@
 (defn valid? [proof]
  "Point-in-time native/definition/binding check. Does not compile or execute a
   callback. Physical graph/SDK leases remain independently mandatory."
- (let [previous (BeamLisp.Env/capture)]
-  (try
-   (BeamLisp.Env/bind (:environment proof))
+ (try (with-environment (:environment proof)
+  (fn []
    (and (= :proved (:status proof))
         (every? publication/valid? (vals (:definitions proof)))
         (every? (fn [[module identity]]
@@ -416,9 +462,8 @@
         (every? (fn [[[ns name lookup] expected]]
                   (let [found (if (= lookup :exact) (BeamLisp.Env/fetch_exact ns name) (BeamLisp.Env/fetch ns name))]
                    (and (tuple? found) (= :ok (elem found 0)) (= expected (native-function (callable-arm (elem found 1) (nth expected 2)))))))
-                (:bindings proof)))
-   (catch _ false)
-   (finally (BeamLisp.Env/bind previous)))))
+                (:bindings proof)))))
+   (catch _ false)))
 (defn- total-under? [proof input facts]
  (every? (fn [obligation]
            (let [value (substitute (:value obligation) input facts)]

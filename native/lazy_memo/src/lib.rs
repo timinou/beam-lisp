@@ -18,6 +18,7 @@ rustler::atoms! { ok, retry, cycle, fast, dirty, reroute, keep, other, over_budg
 mod collector;
 mod collector_schedule;
 mod seen;
+mod file_lock;
 use collector::{register, unregister, Key, Node, Traced};
 
 /// Byte ceiling for the fast (regular-scheduler) lane. A regular NIF must

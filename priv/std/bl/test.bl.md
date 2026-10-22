@@ -133,7 +133,6 @@ anything reading the number rather than the picture.
    per-surface counters and the keys each file wrote. A clean run prints
    NOTHING extra, and without the flag the ledger is not even loaded."
   [paths st]
-  (BeamLisp.Loader/ensure_loaded "reload")
   (BeamLisp.Loader/ensure_loaded "reload.ward")
   (let [ward (BeamLisp.Env/fetch! "reload.ward" "run")
         report (BeamLisp.Env/fetch! "reload.ward" "report")

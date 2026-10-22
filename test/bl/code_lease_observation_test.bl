@@ -1,0 +1,88 @@
+(ns code-lease-observation-test)
+
+(deftest native-owner-observation-does-not-invert-the-module-to-env-lock-order
+  (let [modules (list :Elixir.BeamLisp.Ns.Core)
+        handle (BeamLisp.Env/retain_code! modules)
+        parent (erlang/self) ticket (erlang/make_ref)]
+    (try
+      (let [answer
+            (BeamLisp.Env/with_module_locks modules
+              (fn []
+                (erlang/spawn
+                  (fn []
+                    (let [live (Agent/get :Elixir.BeamLisp.Env
+                                 (fn [_] (BeamLisp.Env/code_lease_active? handle)))]
+                      (erlang/send parent (tuple :observed ticket live)))))
+                (let [timer (erlang/start_timer 2000 (erlang/self) :observation-timeout)]
+                  (receive
+                    [:observed observed live] :when (= observed ticket)
+                    (do (erlang/cancel_timer timer) live)
+                    [:timeout expired :observation-timeout] :when (= expired timer) :timed-out))))]
+        (is (= true answer) "Env can observe while another process holds the module fence"))
+      (finally (BeamLisp.Env/release_code! handle)))
+    (is (not (BeamLisp.Env/code_lease_active? handle)) "released tickets never remain live")))
+
+(deftest loaded-namespace-observation-reuses-the-live-ets-mirror
+  (BeamLisp.Env/isolated
+    (fn []
+      (BeamLisp.Env/mark_loaded "lease-observation.loaded")
+      (let [trace (tuple :Elixir.Agent :get 2)]
+        (erlang/trace_pattern trace true (list :local :call_count))
+        (let [result (try
+                       (let [answers (mapv (fn [_] (BeamLisp.Env/loaded_ns? "lease-observation.loaded")) (range 20))]
+                         [answers (erlang/trace_info trace :call_count)])
+                       (finally (erlang/trace_pattern trace false (list :local :call_count))))]
+          (is (every? true? (first result)))
+          (is (= (tuple :call_count 0) (second result)) "positive reads never queue on Env"))))))
+
+(defserver fenced-start
+ (init [value] (ok value))
+ (handle-call :get [_ state] (reply state state)))
+
+(defn- contended-owner-turn [capacity?]
+ (let [parent (erlang/self) tag (erlang/make_ref)
+       env (Process/whereis :Elixir.BeamLisp.Env)
+       module (BeamLisp.Server/module_for "code-lease-observation-test" "fenced-start")
+       created (atom nil)
+       pattern (tuple :Elixir.BeamLisp.Env :try_with_custody_locks 2)
+       holder (erlang/spawn (fn []
+         (let [hold (fn []
+                      (erlang/send parent [tag :held])
+                      (receive [seen :ask-owner] :when (= seen tag) :ok)
+                      (erlang/send parent
+                        [tag :owner (Agent/get :Elixir.BeamLisp.Env (fn [_] :owner-alive) 5000)]))]
+          (if capacity?
+            (BeamLisp.Env/with_local_lock :bl_code_lease_capacity_held :bl_code_lease_capacity_lock hold)
+            (BeamLisp.Env/with_module_locks (list module) hold)))))
+       contender (atom nil)]
+  (try
+   (is (= :held (receive [seen value] :when (= seen tag) value (after 5000 :timeout))))
+   (erlang/trace_pattern pattern true (list :local))
+   (erlang/trace env true (list :call :arity))
+   (reset! contender (erlang/spawn (fn []
+     (let [pid (start module :fenced-value)]
+       (erlang/send parent [tag :finished pid])))))
+   (is (= :attempted
+     (receive [:trace pid :call [module function arity]]
+      :when (and (= pid env) (= module :Elixir.BeamLisp.Env)
+                 (= function :try_with_custody_locks) (= arity 2)) :attempted
+      (after 5000 :timeout))))
+   (erlang/send holder [tag :ask-owner])
+   (is (= :owner-alive
+     (receive [seen :owner value] :when (= seen tag) value (after 6000 :timeout))))
+   (reset! created
+     (receive [seen :finished value] :when (= seen tag) value (after 6000 nil)))
+   (is (erlang/is_pid @created))
+   (when (erlang/is_pid @created) (is (= :fenced-value (call @created :get))))
+   (finally
+    (when (and @created (Process/alive? @created)) (stop @created))
+    (erlang/trace env false (list :call))
+    (erlang/trace_pattern pattern false (list :local))
+    (doseq [pid [holder @contender]]
+     (when (and pid (Process/alive? pid)) (erlang/exit pid :kill)))))))
+
+(deftest private-owner-retries-module-contention-outside-its-turn
+ (contended-owner-turn false))
+
+(deftest private-owner-retries-capacity-contention-outside-its-turn
+ (contended-owner-turn true))

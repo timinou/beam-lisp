@@ -1,0 +1,274 @@
+; Static reload and isolated-test coherence. This kernel has no process
+; evolution, execution planner, solver or mutation dependency.
+(ns reload.check
+  (:require [reload.events :as events] [env] [typed] [deferred] [source-graph :as sg] [reload.runtime :as runtime]))
+
+(defn declared-ns
+  "The namespace a source string declares — the symbol after a leading `(ns …)`.
+   nil when the first form is not `(ns …)`; a staged edit must name its ns so the
+   bundle keys are stable and match the running image."
+  [src]
+  (try
+    (let [forms (BeamLisp.Reader/read_string src)
+          f     (first forms)]
+      (if (and f (= :list (typed/node-tag (typed/node-form f))))
+        (let [items (typed/node-items (typed/node-form f))
+              head  (typed/node-form (first items))]
+          (if (and (= :symbol (typed/node-tag head))
+                   (= "ns" (typed/node-name (first items))))
+            (typed/node-name (second items))
+            nil))
+        nil))
+    (catch _ nil)))
+
+(def def-forms
+  #{"defn" "defn-" "def" "defmacro" "defmulti" "defmethod"
+    "defrecord" "deftype" "defprotocol" "defserver" "defnative"})
+
+(defn- name-text
+  "The NAME a definition binds, as a STRING.
+
+   A name carrying metadata (`(def ^:private x …)`, `(defn ^:dynamic f …)`) is a
+   `:meta` node in the reader's output, and `node-name` is documented as the
+   text of a symbol or keyword node — call node-form first if the node might be
+   wrapped in metadata. For a `:meta` node it hands back the NODE, not its
+   text. Every consumer of a name in this namespace (bundle-defs, removed-names,
+   promise-errors) compares against `Env/own_names`, which holds strings — so a
+   node here makes an annotated def look like a name the new source DROPPED, and
+   namespace-level replacement then UNDEFINES a var the file still defines. In a
+   running app that is a `500` on every request (session/roots) or a rebuild
+   that refuses to apply (kit/GANTT-*) — on every other save of that file
+   (FUP-033). Peeling here, at the one place a name is produced, is the fix."
+  [node]
+  (str (typed/node-name (typed/node-form node))))
+
+(defn- defn-name
+  "If a form is a top-level definition, the name it binds; else nil. `defmethod`
+   binds no NEW name (it extends an existing defmulti), so it contributes none."
+  [node]
+  (let [f (typed/node-form node)]
+    (if (= :list (typed/node-tag f))
+      (let [items (typed/node-items f)
+            head  (typed/node-name (first items))]
+        (if (and (contains? def-forms head) (not (= "defmethod" head)))
+          (name-text (second items))
+          nil))
+      nil)))
+
+(defn- declared-names
+  "The names introduced by a `(declare a b …)` form, else []."
+  [node]
+  (let [f (typed/node-form node)]
+    (if (and (= :list (typed/node-tag f))
+             (= "declare" (typed/node-name (first (typed/node-items f)))))
+      (map name-text (rest (typed/node-items f)))
+      [])))
+
+(defn bundle-defs
+  "The set of names the bundle DEFINES, per namespace: {ns → #{name …}}. A
+   forward reference to a name defined later in the same bundle is therefore not
+   dangling — the whole edit set is judged together, which is the point."
+  [staged]
+  (reduce (fn [acc pair]
+            (let [ns (first pair) src (second pair)
+                  names (set (filter some?
+                                     (map defn-name (BeamLisp.Reader/read_string src))))]
+              (assoc acc ns (into (get acc ns #{}) names))))
+          {} staged))
+
+(defn- staged?
+  "Whether `ns` is part of THIS bundle — i.e. its whole source is being replaced."
+  [defs ns]
+  (contains? defs ns))
+
+(defn- provides?
+  "Whether `name` resolves in `ns` under NAMESPACE-LEVEL semantics.
+
+   The distinction that makes reload namespace-level rather than variable-level:
+   for a ns IN the bundle, only the names its NEW source defines count — an old
+   var the new source dropped is genuinely gone, so a reference to it is dangling
+   (this is 'the whole renaming ethics': rename `helper`→`helper2` and the old
+   `helper` is removed, not left shadow-callable). For a ns NOT in the bundle,
+   the live image is authoritative (its vars are untouched). core is always
+   available."
+  [defs ns name]
+  (or (contains? (get defs ns #{}) name)
+      (and (not (staged? defs ns))
+           (not (= :error (BeamLisp.Env/fetch ns name))))
+      (contains? (env/implicit-names) name)))
+
+(defn- unqualified-call-heads
+  "Every unqualified, non-core, non-special same-ns call head in one source. By
+   passing an EMPTY `defined` set to the deferral collector's `unknowns-in`, we
+   collect ALL such heads independent of the live image — which is load-bearing
+   for namespace-level reload: a call to a var the new source DROPPED must be
+   seen, and it is still present in the live image (until commit), so a
+   live-baseline collector would wrongly treat it as resolved."
+  [src ns]
+  (let [core (env/implicit-names)
+        forms (BeamLisp.Reader/read_string src)]
+    (reduce (fn [acc form] (concat acc (deferred/unknowns-in form #{} core)))
+            [] forms)))
+
+(defn- dangling-errors
+  "Dangling references in one source: same-ns calls whose head the WHOLE bundle
+   does not provide under namespace-level semantics. Qualified heads
+   (`other.ns/f`) resolve at their target ns and are excluded by the collector;
+   cross-ns removals are caught separately by `removal-errors`."
+  [defs ns src]
+  (let [heads (unqualified-call-heads src ns)
+        still (filter (fn [u] (not (provides? defs ns (:callee u)))) heads)]
+    (map (fn [u] {:kind :dangling :ns ns :var (:callee u)
+                  :msg (str "undefined var: " ns "/" (:callee u)
+                            " — nothing in the bundle or image defines it")})
+         still)))
+
+(defn- promise-errors
+  "Unfulfilled-promise errors: a `(declare x)` with no `(defn x)`/`(def x …)`
+   binding it in the bundle or image. A promise is the static analogue of a
+   queued message — a commitment the bundle must honour before it goes live."
+  [defs ns src]
+  (let [forms    (BeamLisp.Reader/read_string src)
+        declared (mapcat declared-names forms)
+        unbound  (filter (fn [nm] (not (provides? defs ns nm))) declared)]
+    (map (fn [nm] {:kind :promise :ns ns :var nm
+                   :msg (str "declared but never defined in this bundle: " ns "/" nm)})
+         unbound)))
+
+(defn- type-errors
+  "Inferred-type conflicts for one staged source (typed/check-source warnings).
+   Sound-warnings-only: an untypable form is silent, never falsely flagged."
+  [ns src]
+  (let [ws (:warnings (deferred/check-file-deferring src ns))]
+    (map (fn [w] {:kind :type :ns ns :msg (str w)}) ws)))
+
+(defn removed-names
+  "Names the live namespace `ns` currently OWNS but the bundle's new source no
+   longer defines — the vars a whole-namespace reload will drop. Empty when `ns`
+   is new (nothing to remove) or the source is purely additive."
+  [defs ns]
+  (let [new-names (get defs ns #{})
+        live      (set (BeamLisp.Env/own_names ns))]
+    (filter (fn [nm] (not (contains? new-names nm))) live)))
+
+(defn- removal-errors
+  "Cross-namespace dangling from a REMOVAL: for each var this bundle drops from a
+   namespace, any live caller in ANOTHER namespace that is not itself being
+   updated in this bundle. This is the cross-ns half of the renaming ethics — you
+   may not silently delete a var that another live namespace still calls; the
+   bundle is held until those callers are staged too (typically the rename's
+   other half)."
+  [defs ns]
+  (mapcat
+    (fn [nm]
+      (let [outside (filter (fn [pair] (not (staged? defs (first pair))))
+                            (BeamLisp.Env/callers_of ns nm))]
+        (map (fn [pair]
+               {:kind :removal :ns ns :var nm
+                :caller-ns (first pair) :caller (second pair)
+                :msg (str "removing " ns "/" nm " would break live caller "
+                          (first pair) "/" (second pair)
+                          " — stage that namespace too, or keep the var")})
+             outside)))
+    (removed-names defs ns)))
+
+(defn- source-requires
+  "One namespace's require edges from its source, by the one parser
+   (source-graph); nil when no source resolves (an AOT-only beam)."
+  [ns]
+  (let [src (try (BeamLisp.Loader/source_content ns) (catch e nil))]
+    (if (string? src)
+      (let [[_ reqs] (sg/header src)] (vec reqs))
+      nil)))
+
+(defn- image-requires
+  "The SOURCE-derived require edges of the live image, {ns → [dep …]}, from
+   the `:graph` parse-once memo: parsing every loaded namespace's source on
+   every commit measured as the difference between a green reload suite and
+   a native crash (the per-commit full-image re-parse churned the runtime
+   into a SIGSEGV under the ward — BUG-078), so a namespace's source is read
+   once and re-read NEVER; the memo grows only when `Env/namespaces` names
+   a ns it has not seen. What apply-bundle! REMEMBERS (`:requires`) is
+   fresher than this memo and is merged by the caller — filtered to the env
+   being committed into (see require-cycle-errors).
+
+   The boundary, stated: a namespace whose file changes OUTSIDE this gate
+   (edited on disk and re-loaded through the loader, never staged) keeps its
+   first-parsed edges here. Dev edits flow through stage/commit — the watcher
+   is the door — and the build is the backstop for loads that bypass it
+   (build-plan fails on the same sg/cycles answer)."
+  [state]
+  (let [memo (:graph (deref state))
+        missing (filter (fn [ns] (not (contains? memo ns))) (BeamLisp.Env/namespaces))
+        fresh (reduce (fn [acc ns]
+                        (let [r (source-requires ns)]
+                          (if (nil? r) acc (assoc acc ns r))))
+                      {} missing)]
+    (if (empty? fresh)
+      memo
+      (let [grown (merge memo fresh)]
+        (swap! state (fn [s] (assoc s :graph grown)))
+        grown))))
+
+(defn- require-cycle-errors
+  "Require cycles through a STAGED namespace, as held reasons. The merged
+   graph — each staged ns's NEW requires over the live image's — is walked
+   from the bundle's own roots by sg/cycles, the one owner of cycle
+   knowledge (the build fails on the same answer; this gate is the dev-time
+   altitude of it). A cycle admitted here is BUG-064's cross-process loader
+   deadlock shipped into the next cold drop, so the bundle is held until
+   one edge is converted to a by-name lookup — the idiom vm.session already
+   uses for bl.daemon.
+
+   `:requires` is VM-global (the image's memory), but the image being
+   committed into is the CURRENT env — under the ward, a fork. Recorded
+   edges are therefore filtered to namespaces loaded HERE: a sibling fork's
+   commits are not this image's truth."
+  [staged state]
+  (let [recorded (reduce (fn [acc pair]
+                           (let [n (first pair)]
+                             (if (BeamLisp.Env/loaded_ns? n)
+                               (assoc acc n (second pair))
+                               acc)))
+                         {} (:requires (deref state)))
+        merged (reduce (fn [acc pair]
+                         (let [[_ reqs] (sg/header (second pair))]
+                           (assoc acc (first pair) (vec reqs))))
+                       (merge (image-requires state) recorded) staged)
+        roots (vec (map first staged))
+        cycs (sg/cycles roots (fn [n] (get merged n [])))]
+    (map (fn [cyc]
+           {:kind :require-cycle :ns (first cyc)
+            :msg (str "require cycle: " (join " -> " (to-list cyc))
+                      " — a cold AOT load of a require cycle deadlocks (BUG-064);"
+                      " break one edge by resolving that namespace by name"
+                      " (Loader/ensure_loaded + Env/fetch!) at the point of use")})
+         cycs)))
+
+(defn coherence
+  "Every coherence error across the whole bundle, computed STATICALLY from the
+   sources and the live image's public names. Empty ⇒ the bundle is coherent and
+   may be committed. Exposed for the demos/tests to inspect a bundle without
+   committing it. The message predicate is applied by `commit` via the attached
+   migration (Wave 3), not here."
+  ([staged] (coherence staged events/state))
+  ([staged state]
+  (let [defs (bundle-defs staged)]
+    (vec (concat
+          (keep (fn [[ns _]]
+                  (when-let [owner (get @runtime/live-generations ns)]
+                    (when (or (= :sealed owner)
+                              (and (erlang/is_pid owner) (Process/alive? owner)))
+                      {:kind :immutable-generation :ns ns
+                       :msg "Live generation namespace is immutable; activate a fresh generation."}))) staged)
+          (mapcat (fn [pair]
+                           (let [ns (first pair) src (second pair)]
+                             (concat (dangling-errors defs ns src)
+                                     (promise-errors defs ns src)
+                                     (removal-errors defs ns)
+                                     (type-errors ns src))))
+                         staged)
+                 ; a whole-bundle property, not per-ns: the graph, from the
+                 ; staged roots, once.
+                 (require-cycle-errors staged state))))))
+

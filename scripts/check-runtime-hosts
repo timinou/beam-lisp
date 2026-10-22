@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Test runtime host edits against the existing compiler floor, in two VMs.
 
-The first VM compiles only AOT, Env and LazyMemo with the seeded compiler.
+The first VM compiles edited runtime hosts with the seeded compiler.
 The second starts those exact beams, including the NIF wrapper, and runs the
-requested tests. Everything is staged in a temporary image; neither the floor,
+requested tests with the supervised owner registry. Prepared SDKs retain their
+matching sources and artifacts. Everything is staged privately; neither the floor,
 build/, installed drops nor the shared cache is modified. This is a runtime
 regression check, not a replacement for release/compiler bootstrap qualification.
 """
@@ -48,18 +49,32 @@ for app <- Application.spec(:beam_lisp, :applications) || [] do
     error -> raise "dependency #{app}: #{inspect(error)}"
   end
 end
+# Match the application's physical supervisor before boot. The SDK collector
+# starts only after the edited runtime is installed and attested below.
+if System.fetch_env!("HOST_CHECK_PHASE") == "test" do
+  {:ok, _} = Supervisor.start_link([BeamLisp.Env, BeamLisp.Loader.Server],
+    strategy: :one_for_one, name: BeamLisp.Supervisor)
+end
 BeamLisp.AOT.boot()
 IO.puts("HOST-CHECK ready (#{System.fetch_env!("HOST_CHECK_PHASE")})")
 case System.fetch_env!("HOST_CHECK_PHASE") do
   "compile" ->
+    # Reader failures are cheap; find them before compiling hosts or running tests.
+    for path <- System.argv(), do: BeamLisp.Reader.read_string(BeamLisp.Loader.read_source(path), path)
     output = Path.join(root, "host-overlay")
     File.mkdir_p!(output)
     manifest = Enum.reduce([
       {"aot.bl", BeamLisp.AOT},
+      {"aot_cache.bl", BeamLisp.AOTCache},
+      {"build_plan.bl", BeamLisp.BuildPlan},
+      {"bootstrap.bl", BeamLisp.Bootstrap},
       {"env.bl", BeamLisp.Env},
       {"loader.bl", BeamLisp.Loader},
       {"reader.bl", BeamLisp.Reader},
-      {"lazy_memo.bl", BeamLisp.LazyMemo}
+      {"lazy_memo.bl", BeamLisp.LazyMemo},
+      {"package_authority.bl", BeamLisp.PackageAuthority},
+      {"seq_cursor_enumerable.bl", Enumerable.BeamLisp.SeqCursor},
+      {"lazy_seq_enumerable.bl", Enumerable.BeamLisp.LazySeq}
     ], manifest, fn {leaf, mod}, acc ->
       source = Path.join(root, "edited-hosts/#{leaf}")
       digest = Base.encode16(:crypto.hash(:sha256, File.read!(source)), case: :lower)
@@ -68,49 +83,88 @@ case System.fetch_env!("HOST_CHECK_PHASE") do
       stamp = path <> ".stamp"
       want = manifest["compiler_key"] <> ":" <> digest
       if not (File.exists?(path) and File.read(stamp) == {:ok, want}) do
-        {^mod, ^path} = BeamLisp.AOT.compile_host_file(source,
-          module: mod, output_dir: output, source_hash: digest, load?: false)
+        if File.exists?(Path.join(root, "unchanged-hosts/#{leaf}")) do
+          File.cp!(Path.join(seed, Atom.to_string(mod) <> ".beam"), path)
+        else
+          {^mod, ^path} = BeamLisp.AOT.compile_host_file(source,
+            module: mod, output_dir: output, source_hash: digest, load?: false)
+        end
         File.write!(stamp, want)
       end
       bytes = File.read!(path)
       name = Atom.to_string(mod) <> ".beam"
-      if mod != BeamLisp.AOT do
+      if mod not in [BeamLisp.AOT, BeamLisp.BuildPlan] do
         File.write!(Path.join(seed, name), bytes)
+        if File.dir?(Path.join(root, "ebin")), do: File.write!(Path.join(root, "ebin/#{name}"), bytes)
         File.cp!(source, Path.join(root, "priv/host/#{leaf}"))
       end
       IO.puts("HOST-CHECK prepared #{leaf} in #{System.monotonic_time(:millisecond) - started} ms")
-      if mod == BeamLisp.AOT, do: acc,
+      if mod in [BeamLisp.AOT, BeamLisp.BuildPlan], do: acc,
         else: put_in(acc, ["modules", name], Base.encode16(:crypto.hash(:sha256, bytes), case: :lower))
     end)
     File.write!(Path.join(seed, "manifest.term"), :io_lib.format(~c"~tp.~n", [manifest]))
+  "sdk" ->
+    # This is an explicit SDK build, before the runtime test VM exists. Use
+    # the normal compiler for top-level SDK macro declarations; a runtime's
+    # bounded declaration interpreter is intentionally not a build driver.
+    BeamLisp.Loader.ensure_loaded("build")
+    result = BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch_exact!("build", "run"),
+      [%{sources: Enum.map(System.argv(), &Path.expand/1), root: Path.join(root, "priv"), out: Path.join(root, "ebin"), scope: :scoped, jobs: 1,
+         log: fn message -> IO.puts("HOST-CHECK SDK #{message}") end}])
+    IO.inspect(Map.take(result, [:built, :compiled, :cached, :errors]), label: "HOST-CHECK SDK")
+    if Enum.any?(result.errors), do: System.halt(1)
+    invoke = fn name, args -> BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch_exact!("build", name), args) end
+    invoke.("relocate-unit-sources!", [result.manifest, Path.join(root, "priv"), Path.join(root, "ebin")])
+    index = Path.join(root, "priv/precompiled.term")
+    extra = Path.join(root, "edited-precompiled.term")
+    invoke.("write-precompiled-index!", [result.manifest, Path.join(root, "ebin"), extra])
+    old = :erlang.binary_to_term(File.read!(index), [:safe])
+    edited = :erlang.binary_to_term(File.read!(extra), [:safe])
+    File.write!(index, :erlang.term_to_binary(%{old | entries: Map.merge(old.entries, edited.entries)}, [:deterministic]))
+    IO.puts("HOST-CHECK SDK sealed #{map_size(edited.entries)} complete units")
   "test" ->
     # Bootstrap with the frozen compiler's own source, then load the edited
     # runtime BEFORE publishing its first SDK lease. Never replace a leased SDK.
     BeamLisp.AOT.bootstrap_sdk_native_hosts!()
     if :ets.lookup(:beam_lisp_vars, :bl_sdk_runtime_lease) != [],
       do: raise "bootstrap unexpectedly published an SDK lease before host overlay"
-    mod = BeamLisp.AOT
-    path = Path.join(root, "host-overlay/Elixir.BeamLisp.AOT.beam")
-    bytes = File.read!(path)
-    # Keep the compiler source snapshot frozen; this exercises runtime-only
-    # replacements, not a change of compiler generation.
-    File.write!(Path.join(seed, "Elixir.BeamLisp.AOT.beam"), bytes)
-    manifest = put_in(manifest, ["modules", "Elixir.BeamLisp.AOT.beam"],
-      Base.encode16(:crypto.hash(:sha256, bytes), case: :lower))
-    File.write!(Path.join(seed, "manifest.term"), :io_lib.format(~c"~tp.~n", [manifest]))
-    {:module, ^mod} = :code.load_binary(mod, String.to_charlist(path), bytes)
+    for mod <- [BeamLisp.AOT, BeamLisp.BuildPlan, Enumerable.BeamLisp.SeqCursor, Enumerable.BeamLisp.LazySeq] do
+      name = Atom.to_string(mod) <> ".beam"
+      path = Path.join(root, "host-overlay/" <> name)
+      bytes = File.read!(path)
+      # Freeze compiler inputs during bootstrap, then exercise edited runtime
+      # algorithms without claiming a new compiler-generation qualification.
+      File.write!(Path.join(seed, name), bytes)
+      if File.dir?(Path.join(root, "ebin")), do: File.write!(Path.join(root, "ebin/" <> name), bytes)
+      {:ok, [current]} = :file.consult(String.to_charlist(Path.join(seed, "manifest.term")))
+      current = put_in(current, ["modules", name], Base.encode16(:crypto.hash(:sha256, bytes), case: :lower))
+      File.write!(Path.join(seed, "manifest.term"), :io_lib.format(~c"~tp.~n", [current]))
+      {:module, ^mod} = :code.load_binary(mod, String.to_charlist(path), bytes)
+    end
     BeamLisp.Env.retain_sdk_runtime!()
-    # SDK retention must not silently replace the runtime under test with its
-    # frozen bootstrap host. Verify actual loaded code, not just emitted files.
-    {:ok, {^mod, expected_md5}} = :beam_lib.md5(bytes)
-    if mod.module_info(:md5) != expected_md5,
-      do: raise "SDK retention replaced the edited AOT host under test"
-    IO.puts("HOST-CHECK edited AOT remains loaded after SDK retention")
+    # Retention must preserve the actual edited hosts, not merely their files.
+    for mod <- [BeamLisp.AOT, BeamLisp.BuildPlan, Enumerable.BeamLisp.SeqCursor, Enumerable.BeamLisp.LazySeq] do
+      bytes = File.read!(Path.join(root, "host-overlay/" <> Atom.to_string(mod) <> ".beam"))
+      {:ok, {^mod, expected_md5}} = :beam_lib.md5(bytes)
+      if mod.module_info(:md5) != expected_md5,
+        do: raise "SDK retention replaced the edited #{inspect(mod)} host under test"
+    end
+    IO.puts("HOST-CHECK edited AOT remains loaded after SDK retention; BuildPlan and SeqCursor Enumerable verified too")
+    BeamLisp.Loader.ensure_loaded("proc.owner-registry")
+    BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch_exact!("proc.owner-registry", "start-child!"), [])
     # Re-use the image, isolate each suite's registry, and enforce real results.
     results = Enum.map(System.argv(), fn path ->
       IO.puts("HOST-CHECK running #{path}")
       started = System.monotonic_time(:millisecond)
-      task = Task.async(fn -> BeamLisp.TestRT.run_suite([path], []) end)
+      task = Task.async(fn ->
+        result = BeamLisp.TestRT.run_suite([path], [])
+        for {{:test_run, namespace}, stats} <- Process.get(),
+            report <- Map.get(stats, :reports, []), report.type == :error do
+          IO.inspect({namespace, report.test, BeamLisp.ExInfo.ex_data(report.actual)},
+            label: "HOST-CHECK error context", limit: 12, printable_limit: 512)
+        end
+        result
+      end)
       await = fn await, remaining, previous ->
         case Task.yield(task, min(remaining, 30_000)) do
           nil when remaining > 30_000 ->
@@ -132,16 +186,16 @@ case System.fetch_env!("HOST_CHECK_PHASE") do
         {:ok, totals} when is_map(totals) ->
           IO.puts("HOST-CHECK result #{path}: #{inspect(totals)} (#{System.monotonic_time(:millisecond) - started} ms)")
           if Map.get(totals, :tests, 0) == 0, do: raise "suite ran no tests"
-          if Map.get(totals, :fail, 0) + Map.get(totals, :error, 0) > 0,
-            do: System.halt(1)
           totals
         other -> raise "suite did not finish successfully: #{inspect(other)}"
       end
     end)
     total = Enum.reduce(results, %{tests: 0, pass: 0, fail: 0, error: 0},
       fn totals, acc -> Map.merge(acc, totals, fn _, a, b -> a + b end) end)
-    IO.puts("HOST-CHECK passed #{length(results)} files: #{inspect(total)}")
+    IO.puts("HOST-CHECK finished #{length(results)} files: #{inspect(total)}")
+    if total.fail + total.error > 0, do: System.halt(1)
 end
+File.write!(Path.join(root, "phase-" <> System.fetch_env!("HOST_CHECK_PHASE") <> ".complete"), "ok")
 '''
 
 
@@ -151,12 +205,20 @@ def main():
                         help="seed-matching aot.bl and env.bl saved before editing")
     parser.add_argument("--work-dir", type=Path,
                         help="keep this isolated image and reuse unchanged host beams")
+    parser.add_argument("--sdk-image", type=Path,
+                        help="qualified SDK app directory; reuse verified units in the private image")
+    parser.add_argument("--compile-sdk", action="append", default=[], metavar="SOURCE",
+                        help="explicitly build an edited SDK unit before runtime tests; repeatable")
+    parser.add_argument("--native-runtime", type=Path,
+                        help="new lazy_memo library; install only after compiling its matching facade")
     parser.add_argument("--suite-timeout", type=int, default=120,
                         help="seconds per test file (default: 120)")
     parser.add_argument("tests", nargs="*")
     args = parser.parse_args()
     if not 1 <= args.suite_timeout <= 840:
         parser.error("--suite-timeout must be between 1 and 840 seconds")
+    if args.compile_sdk and args.sdk_image and (args.sdk_image / "priv/sdk-code.term").is_file():
+        parser.error("--compile-sdk requires an unsealed build image; build a complete SDK before testing sealed ownership")
     tests = args.tests or DEFAULT_TESTS
     for name in tests:
         if not (ROOT / name).is_file():
@@ -174,18 +236,53 @@ def main():
         if (root / "priv").exists():
             shutil.rmtree(root / "priv")
         # Copy-on-write where available; copy only repository inputs, never build/.
-        subprocess.run(["cp", "-a", "--reflink=auto", str(ROOT / "priv"), temp], check=True)
+        base_priv = args.sdk_image.resolve() / "priv" if args.sdk_image else ROOT / "priv"
+        subprocess.run(["cp", "-a", "--reflink=auto", str(base_priv), temp], check=True)
+        # A prepared SDK binds source bytes as well as artifacts. Preserve that
+        # complete input; explicitly requested units are the only SDK edits.
+        for name in args.compile_sdk:
+            relative = Path(name)
+            if relative.is_absolute() or ".." in relative.parts or relative.parts[0] != "priv":
+                raise SystemExit("--compile-sdk must name a checkout-relative priv source")
+            (root / relative).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / relative, root / relative)
         shutil.copy2(ROOT / "env.bl", root / "env.bl")
+        if args.sdk_image:
+            sdk = args.sdk_image.resolve()
+            if not (sdk / "priv/precompiled.term").is_file() or not (sdk / "ebin").is_dir():
+                raise SystemExit("--sdk-image needs an app with priv/precompiled.term and ebin/")
+            if (root / "ebin").exists():
+                shutil.rmtree(root / "ebin")
+            subprocess.run(["cp", "-a", "--reflink=auto", str(sdk / "ebin"), str(root / "ebin")], check=True)
+            shutil.copy2(sdk / "priv/precompiled.term", root / "priv/precompiled.term")
+            if (sdk / "priv/sdk-code.term").is_file():
+                shutil.copy2(sdk / "priv/sdk-code.term", root / "priv/sdk-code.term")
+            # Exact floor beams override SDK leaves; edited hosts overlay next.
+            subprocess.run(["cp", "-a", "--reflink=auto", str(root / "priv/bootstrap/seed") + "/.", str(root / "ebin")], check=True)
+        def bootstrap_source(leaf):
+            if args.bootstrap_hosts and (args.bootstrap_hosts / leaf).is_file():
+                return (args.bootstrap_hosts / leaf).read_bytes()
+            if args.sdk_image:
+                # Compare against the SDK's actual source/artifact pair, even
+                # after the edited sources have been committed on this branch.
+                source = base_priv / "host" / leaf
+                return source.read_bytes() if source.is_file() else (ROOT / "priv/host" / leaf).read_bytes()
+            return subprocess.check_output(["git", "show", f"HEAD:priv/host/{leaf}"], cwd=ROOT)
+
         edited = root / "edited-hosts"
         edited.mkdir(exist_ok=True)
-        for leaf in ("aot.bl", "env.bl", "loader.bl", "reader.bl", "lazy_memo.bl"):
+        for leaf in ("aot.bl", "aot_cache.bl", "build_plan.bl", "bootstrap.bl", "env.bl", "loader.bl", "reader.bl", "lazy_memo.bl", "package_authority.bl", "seq_cursor_enumerable.bl", "lazy_seq_enumerable.bl"):
             shutil.copy2(ROOT / "priv/host" / leaf, edited / leaf)
-        for leaf in ("aot.bl", "env.bl", "loader.bl", "reader.bl"):
-            if args.bootstrap_hosts:
-                shutil.copy2(args.bootstrap_hosts / leaf, root / "priv/host" / leaf)
-            else:
-                original = subprocess.check_output(["git", "show", f"HEAD:priv/host/{leaf}"], cwd=ROOT)
-                (root / "priv/host" / leaf).write_bytes(original)
+        for leaf in ("aot.bl", "aot_cache.bl", "build_plan.bl", "bootstrap.bl", "env.bl", "loader.bl", "reader.bl"):
+            (root / "priv/host" / leaf).write_bytes(bootstrap_source(leaf))
+        unchanged = root / "unchanged-hosts"
+        if unchanged.exists():
+            shutil.rmtree(unchanged)
+        unchanged.mkdir()
+        for leaf in ("aot.bl", "aot_cache.bl", "build_plan.bl", "bootstrap.bl", "env.bl", "loader.bl", "reader.bl", "lazy_memo.bl", "package_authority.bl", "seq_cursor_enumerable.bl", "lazy_seq_enumerable.bl"):
+            original = bootstrap_source(leaf)
+            if (edited / leaf).read_bytes() == original and (root / "priv/bootstrap/seed" / ("Elixir.BeamLisp.PackageAuthority.beam" if leaf == "package_authority.bl" else "manifest.term")).is_file():
+                (unchanged / leaf).touch()
         # Freeze test/fixtures too, so retries are reproducible and fixture
         # writes cannot modify the checkout through an image symlink.
         if (root / "test").is_symlink():
@@ -202,7 +299,7 @@ def main():
             if (image / name).is_symlink():
                 (image / name).unlink()
         (image / "priv").symlink_to(root / "priv", target_is_directory=True)
-        (image / "ebin").symlink_to(root / "priv/bootstrap/seed", target_is_directory=True)
+        (image / "ebin").symlink_to(root / "ebin" if args.sdk_image else root / "priv/bootstrap/seed", target_is_directory=True)
         driver = root / "check.exs"
         driver.write_text(DRIVER)
         caches = [Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))]
@@ -217,26 +314,34 @@ def main():
         for dep in dict.fromkeys(deps):
             command.extend(["-pa", str(dep)])
         command.extend(["-pa", str(image / "ebin"), str(driver)])
-        for phase in ("compile", "test"):
+        phases = ("compile", "sdk", "test") if args.compile_sdk else ("compile", "test")
+        for phase in phases:
+            if phase != "compile" and args.native_runtime:
+                shutil.copy2(args.native_runtime.resolve(), root / "priv/native/lazy_memo.so")
             print(f"HOST-CHECK {phase}: isolated image, existing compiler, 6G cap", flush=True)
             env = os.environ.copy()
             env.update(BL_ROOT=str(root), BL_DAEMON="off", HOST_CHECK_PHASE=phase,
                        XDG_CACHE_HOME=str(root / "cache"), HOST_CHECK_TIMEOUT_MS=str(args.suite_timeout * 1000),
+                       AOT_ACTOR_INVENTORY_SOURCE=str(root / "edited-hosts/aot.bl"),
                        ERL_FLAGS="+S 4:4 +SDcpu 2:2 +SDio 1:1 +sbwt none +sbwtdcpu none +sbwtdio none")
             env.pop("BEAM_LISP_DEV", None)
             cap = ["systemd-run", "--user", "--collect", "--wait", "--pipe",
                    f"--unit=bl-host-check-{os.getpid()}-{phase}",
                    f"--working-directory={root}", "--property=MemoryMax=6G",
                    "--property=MemorySwapMax=0", "--property=RuntimeMaxSec=900"]
-            for key in ("BL_ROOT", "BL_DAEMON", "HOST_CHECK_PHASE", "XDG_CACHE_HOME", "ERL_FLAGS", "HOST_CHECK_TIMEOUT_MS"):
+            for key in ("PATH", "BL_ROOT", "BL_DAEMON", "HOST_CHECK_PHASE", "XDG_CACHE_HOME", "ERL_FLAGS", "HOST_CHECK_TIMEOUT_MS", "AOT_ACTOR_INVENTORY_SOURCE"):
                 cap.append(f"--setenv={key}={env[key]}")
+            completed = root / f"phase-{phase}.complete"
+            completed.unlink(missing_ok=True)
             try:
-                result = subprocess.run(cap + command + (tests if phase == "test" else []), env=env)
+                result = subprocess.run(cap + command + (tests if phase in ("test", "compile") else args.compile_sdk if phase == "sdk" else []), env=env)
             finally:
                 subprocess.run(["systemctl", "--user", "stop", f"bl-host-check-{os.getpid()}-{phase}"],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if result.returncode:
                 raise SystemExit(result.returncode)
+            if not completed.is_file():
+                raise SystemExit(f"HOST-CHECK {phase} stopped before completion")
 
 
 if __name__ == "__main__":

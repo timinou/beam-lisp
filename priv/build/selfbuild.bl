@@ -199,14 +199,15 @@
           (assoc acc :stages (assoc (:stages acc) :floor-reused (count (get manifest "modules")))))))))
 
 (defn- library-root
-  "The fixed root a library compile stages under. Its shape is an application
+  "Compiler-keyed persistent library workspace. Its shape is an application
    release (`beam_lisp-0.1.0/{ebin,priv}`) because the CHILD VM resolves
    `:code.priv_dir` through it: `priv` must be the source root for the tier
    checks, and the ebin must be a real directory because the floor is installed
-   into it. FIXED like `staging-root`, for the same reason — a beam embeds the
-   path of the source it was compiled from."
+   into it. Producer units, manifest and log survive release-tree cleanup;
+   the path stays stable throughout this compiler generation."
   []
-  (Path/join (System/tmp_dir) "bl-selfbuild-lib/beam_lisp-0.1.0"))
+  (Path/join (Path/join (Path/join (BeamLisp.AOTCache/dir) "sdk-build")
+                                   (BeamLisp.AOTCache/compiler_key)) "beam_lisp-0.1.0"))
 
 (defn- path-string
   "A code-path entry as a string. `:code.get_path/0` answers charlists."
@@ -234,7 +235,10 @@
    from the floor. `ebin` receives the running image's BEAMs so the floor can be
    installed from the seed."
   [root]
-  (c/clear! root)
+  ;; Compiler-keyed outputs and their log survive disposable packaging.
+  ;; Only bootstrap inputs are replaced; they never overwrite producer units.
+  (c/clear! (Path/join root "priv"))
+  (c/clear! (Path/join root "ebin"))
   (let [priv (Path/join root "priv")
         ebin (Path/join root "ebin")
         running (rel/text (BeamLisp.Tiers/priv_root))
@@ -260,9 +264,16 @@
    are the ones the drop was built by."
   []
   (Enum/join
-    (list " [stage, ebin, mpath, lpath, jobs, shadow, result] = System.argv()"
+    (list " [stage, ebin, mpath, lpath, jobs, shadow, result, custody] = System.argv()"
+          "{generation, {anchor, claim, record}} = :erlang.binary_to_term(Base.decode64!(custody), [:safe])"
+          "BeamLisp.LazyMemo.ensure_loaded!()"
+          "{:ok, generation_lease} = BeamLisp.LazyMemo.nif_file_lock(generation, true, false)"
+          "{:ok, workspace_lease} = BeamLisp.LazyMemo.nif_file_lock(anchor, true, false)"
+          "if File.read(claim) != {:ok, record}, do: raise(\"SDK workspace claim changed before child startup\")"
+          ":persistent_term.put(:bl_sdk_producer_custody, {generation_lease, workspace_lease})"
           "BeamLisp.Bootstrap.install!(shadow)"
           "BeamLisp.AOT.boot()"
+          "Code.prepend_path(ebin)"
           ":ok = BeamLisp.Loader.ensure_loaded(\"build\")"
           "run = BeamLisp.Env.fetch!(\"build\", \"run\")"
           "select = BeamLisp.Env.fetch!(\"build\", \"namespace-sources\")"
@@ -281,13 +292,16 @@
   [root ebin scratch jobs]
   (let [exe (some-> (System/find_executable "elixir") path-string)
         result (Path/join scratch "library-result.term")
-        manifest (Path/join scratch "library-manifest")
-        logpath (Path/join scratch "library-build.log")
+        manifest (Path/join root "library-manifest")
+        logpath (Path/join root "library-build.log")
+        custody (Base/encode64 (erlang/term_to_binary
+                  (tuple (BeamLisp.AOTCache/generation_lock_path (Path/expand (BeamLisp.AOTCache/dir))
+                            (BeamLisp.AOTCache/compiler_key)) (c/follower-context root))))
         pa (erlang/++ (Enum/flat_map (Enum/reverse (code/get_path))
                         (fn [p] (list "-pa" (path-string p))))
                       (list "-pa" (Path/join root "ebin")))
         args (erlang/++ (list "-e" (library-program) "--")
-                      (list (Path/join root "priv") ebin manifest logpath (Integer/to_string jobs) (Path/join root "ebin") result))
+                      (list (Path/join root "priv") ebin manifest logpath (Integer/to_string jobs) (Path/join root "ebin") result custody))
         _ (File/rm result)
         r (System/cmd exe (erlang/++ pa args)
                      (list (tuple :cd root) (tuple :stderr_to_stdout true)
@@ -330,7 +344,7 @@
    build tiers as SOURCE. Without this stage the first `bl run` on a fresh
    machine pays to compile every library namespace it touches; the release
    build already has the sources and the right compiler, so it pays that cost
-   once, here. The manifest and log stay in `scratch` (a release carries no
+   once, here. The manifest and log stay in the producer workspace (a release carries no
    build state). `precompiled.term` indexes complete library units, while
    `sdk-code.term` authenticates their executable ownership for managed actors
    and live upgrades. Both belong in the payload; a scratch-only attestation
@@ -346,12 +360,19 @@
   [acc scratch ebin jobs]
   (if (failed? acc)
     acc
-    (let [root (library-root)
+    (BeamLisp.AOTCache/with_generation (BeamLisp.AOTCache/compiler_key)
+     (fn []
+      (let [root (library-root) acquired (c/acquire! root "SDK producer")]
+       (if-not (:ok? acquired)
+        (with-error acc (str "SDK workspace held by " (pr-str (:held acquired))))
+        (try
+         (let [outputs (Path/join root "units")
           payload (do (stage-library-root! root) ebin)
-          r (run-library-child! root payload scratch jobs)]
+          r (run-library-child! root outputs scratch jobs)]
       (if-not (:ok? r)
         (reduce with-error acc (map (fn [e] (str "build: " e)) (:errors r)))
-        (let [_ (b/relocate-unit-sources! (:manifest r) (Path/join root "priv") payload)
+        (let [_ (b/assemble-outputs! (:manifest r) outputs payload)
+              _ (b/relocate-unit-sources! (:manifest r) (Path/join root "priv") payload)
               inventory (BeamLisp.AOT/write_sdk_inventory! (Path/join root "priv")
                         (complete-library-inventory (:manifest r) (Path/join root "priv") payload) payload
                         (Path/join (Path/dirname payload) "priv/sdk-code.term"))]
@@ -359,7 +380,8 @@
             (Path/join (Path/dirname payload) "priv/precompiled.term"))
           (assoc acc :built (:built r) :compiled (:compiled r) :cached (:cached r)
                      :stages (assoc (:stages acc) :sources (:sources r)
-                                    :sdk-code-modules inventory)))))))
+                                    :sdk-code-modules inventory)))))
+         (finally (c/release! root)))))))))
 
 (defn- do-app
   "Stage 2b: rewrite `beam_lisp.app` AFTER every payload beam exists.
@@ -391,8 +413,9 @@
   (if (failed? acc)
     acc
     (let [priv (Path/join (app-dir tree v :beam_lisp) "priv")
-          n (bp/prime! priv (vec (BeamLisp.Tiers/sources priv)))]
-      (assoc acc :stages (assoc (:stages acc) :primed n)))))
+          n (bp/prime! priv (vec (BeamLisp.Tiers/sources priv)))
+          native (BeamLisp.AOT/prime_native_declarations! priv)]
+      (assoc acc :stages (assoc (:stages acc) :primed n :primed-native-declarations native)))))
 
 (defn source-provenance
   "Where the sources this build stages came from. A checkout run through
@@ -454,7 +477,6 @@
         c (if (some? bin) (d/compound bin) nil)
         tree (Path/join scratch "tree")
         stage (staging-root)
-        other (c/held-by stage)
         base {:ok? true :out out :tree tree :built 0 :ex 0 :errors []
               :running-root (running-root)
               :stages {:assemble 0 :sources 0 :verify false}}]
@@ -473,11 +495,11 @@
              " ./bin/bl self-build --bin ./bl --out ./bl-new"))
 
       (some? bin)
-      (if (some? other)
+      (let [acquired (c/acquire! stage bin) other (:held acquired)]
+       (if (not (:ok? acquired))
         (with-error base (str "another self-build holds the staging root " stage
                               " (pid " (:pid other) ", since " (:at other) ")"))
-        (do (c/acquire! stage bin)
-            (try
+        (do (try
               (let [v (rel/value :beam_lisp)
                     ; `:os` is the SOURCE drop's tag when there is a source drop,
                     ; and this machine's own tag when there is not (a checkout).
@@ -497,7 +519,7 @@
                     (do-stamp tree (or (:provenance opts) (source-provenance)))
                     (do-pack tree bin c out os scratch)
                     (do-verify out)))
-              (finally (c/release! stage)))))
+              (finally (c/release! stage))))))
 
       :else
       (with-error base

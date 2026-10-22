@@ -348,6 +348,13 @@
       (MapSet/member? loading ns)
       :ok
 
+      ;; Admit the caller before Loader.Server conveys its context. A worker's
+      ;; borrowed loader-module lease is not application execution custody.
+      (and (or (Process/get :bl_generation) (Process/get :bl_application_identity))
+           (let [path (source_path ns)]
+             (and path (BeamLisp.AOT/sdk_library_source? ns path))))
+      (BeamLisp.Env/load_sdk_library! ns)
+
       :else
       (let [dirs (or fixed (Process/get :bl_search_dirs)
                    (erlang/++ (or (Process/get :bl_ambient_dirs) (list (File/cwd!)))
@@ -410,7 +417,16 @@
       (Process/put :bl_loading (MapSet/put (Process/get :bl_loading (MapSet/new)) ns))
 
       (try
-        (let [r (if (= :aot (load_route ns)) (BeamLisp.AOT/ensure_loaded ns) :no_module)]
+        (let [r (if (= :aot (load_route ns))
+                  (let [path (source_path ns)]
+                    ;; SDK source and AOT loads have the same global lifetime.
+                    ;; Selecting the realm here bypassed SDK unit preparation,
+                    ;; publishing receipts for unloaded bodies before init.
+                    (or (ensure_build_aot ns path)
+                        (if (and path (BeamLisp.AOT/sdk_library_source? ns path))
+                          (BeamLisp.Env/with_env :global (fn [] (BeamLisp.AOT/ensure_loaded ns)))
+                          (BeamLisp.AOT/ensure_loaded ns))))
+                  :no_module)]
           (cond
             (erlang/== r :loaded) :ok
             (erlang/== r :no_module) (ensure_loaded_source ns)
@@ -419,6 +435,26 @@
         (finally
           (Process/put :bl_loading
             (MapSet/delete (Process/get :bl_loading (MapSet/new)) ns)))))))
+
+(defn- ensure_build_aot
+  "Restore a current SDK build unit through the ordinary complete-unit loader.
+   Build-floor staleness uses compile.beam_lisp, which a shipped SDK deliberately
+   omits. Its sealed index is sufficient: use the build key, verify the complete
+   entry, then publish every member before receipts or initializer effects."
+  [ns path]
+  (when (and path (erlang/== :build (BeamLisp.Tiers/tier_of_ns ns)))
+    (let [source (BeamLisp.AOT/physical_sdk_path path)
+          root (BeamLisp.AOT/physical_sdk_path (BeamLisp.Tiers/priv_root))]
+      (when (and source root (BeamLisp.Tiers/build_source? source root)
+                 (erlang/== ns (declared_ns (read_source source))))
+        (let [key (BeamLisp.AOTCache/key_for_ns ns)
+              closure (BeamLisp.AOT/ns_closure_hash ns)
+              directory (when closure (BeamLisp.AOTCache/entry_dir key closure))
+              modules (when directory (BeamLisp.AOTCache/valid_keyed_entry directory key closure))]
+          (when (and modules (Enum/member? modules (BeamLisp.Emit/module_for ns)))
+            (BeamLisp.Env/with_env :global
+              (fn [] (BeamLisp.AOT/load_cached_entry ns modules directory directory)))
+            :loaded))))))
 
 (defn- ensure_loaded_source
   "Load `ns` from source. One loader per FILE VM-wide: the lock is keyed on the
@@ -513,14 +549,16 @@
       nil)))
 
 (defn- tier_ids
-  "{device, inode} of every tier dir, memoised: the tiers are a constant of the image.
+  "{device, inode} of every tier dir, memoised per physical image root.
    Identity, not a string prefix: the launcher reaches a tree's priv through a symlink."
   []
-  (let [cached (persistent_term/get :bl_tier_ids nil)]
+  (let [root (BeamLisp.Tiers/priv_root)
+        key (tuple :bl_tier_ids root (path_id root))
+        cached (persistent_term/get key nil)]
     (if (erlang/== nil cached)
       (let [ids (Enum/flat_map (BeamLisp.Tiers/dirs)
                   (fn [d] (let [id (path_id d)] (if (erlang/== nil id) (list) (list id)))))]
-        (persistent_term/put :bl_tier_ids ids)
+        (persistent_term/put key ids)
         ids)
       cached)))
 
@@ -565,8 +603,19 @@
   (or (Enum/any? (BeamLisp.Tiers/dirs)
         (fn [d] (Enum/any? (source_relatives ns)
                   (fn [rel] (File/regular? (Path/join d rel))))))
-      (let [mod (BeamLisp.Emit/base_module_for ns)]
-        (and (Code/ensure_loaded? mod) (erlang/function_exported mod :__bl_init__ 0)))))
+      (let [mod (BeamLisp.Emit/base_module_for ns)
+            loaded (Code/ensure_loaded? mod)
+            path (when loaded (code/which mod))
+            ebin (Path/join (Path/dirname (BeamLisp.Tiers/priv_root)) "ebin")]
+        ;; Every ordinary AOT application also has __bl_init__. Only an image
+        ;; artifact with the SDK's checked declaration row owns a tier name.
+        ;; Reject ordinary output paths before consulting the image inventory.
+        (and loaded (erlang/is_list path)
+             (erlang/== (Path/dirname (Path/expand (erlang/list_to_binary path))) (Path/expand ebin))
+             (erlang/function_exported mod :__bl_init__ 0)
+             (let [row (BeamLisp.AOT/sdk_compiler_row mod)]
+               (and row (erlang/== ns (Map/get row :forwarder-namespace))
+                        (erlang/== :mutable-forwarder (Map/get row :role))))))))
 
 (defn- facts_home
   "`namespace_home` for `ns` served by `path`, in the realm `realm` (or nil)."
@@ -690,7 +739,7 @@
    classify it."
   [source]
   (let [hash (crypto/hash :sha256 source)
-        key (tuple :bl_replayable_v2 hash)
+        key (tuple :bl_replayable_v3 hash)
         hit (persistent_term/get key :none)]
     (if (erlang/not (erlang/== hit :none)) hit
       (let [file (replayable_memo_file hash)
@@ -712,7 +761,7 @@
   [hash]
   (try
     (when (BeamLisp.AOTCache/enabled?)
-      (Path/join (Path/join (Path/join (BeamLisp.AOTCache/dir) "replayable-v2") (BeamLisp.AOTCache/compiler_key))
+      (Path/join (Path/join (Path/join (BeamLisp.AOTCache/dir) "replayable-v3") (BeamLisp.AOTCache/compiler_key))
                  (binary/encode_hex hash)))
     (catch _ nil)))
 
@@ -732,7 +781,7 @@
       (and (erlang/== 1 (Enum/count heads (fn [head] (erlang/== "ns" head))))
            (Enum/all? heads
              (fn [head] (list-member?
-               (list "ns" "defn" "defn-" "def" "defmacro" "defserver" "defrecord"
+               (list "ns" "declare" "defn" "defn-" "def" "defmacro" "defserver" "defrecord"
                      "deftype" "defprotocol" "defmulti" "extend-type" "extend-protocol"
                      "defnative") head)))))
     (catch _ false)))
@@ -753,7 +802,9 @@
                (or (erlang/== (file_kind path) :project) (would_replace_compiled? ns)))
             (erlang/error (Elixir.RuntimeError/exception (refusal_message ns path)))
           (list-member? (local_homes) home) :source
-          (erlang/not (replayable_source? (read_source path))) :source
+          (erlang/not (or (replayable_source? (read_source path))
+                         (and (erlang/function_exported :Elixir.BeamLisp.AOT :replayable_cached_source? 2)
+                              (BeamLisp.AOT/replayable_cached_source? ns path)))) :source
           :else :aot)))))
 
 (defn- do_load
@@ -817,10 +868,9 @@
   ([ns path content e]
    (load_attribution ns path content e nil))
   ([ns path content e stacktrace]
-   (let [;; Attribution must not replay a refused compile-only SDK file: that
-         ;; would execute the initializer the producer deliberately deferred.
-         counted (if (try (BeamLisp.AOT/sdk_library_source? ns path) (catch _ true))
-                   :unknown (form_at_fault ns path content))
+   (let [;; Diagnostics inspect locations and reader data only. Replaying even
+         ;; ordinary source repeats already-completed initializer effects.
+         counted (form_at_fault path content stacktrace)
          where
          (cond
            (ok4-result? counted)
@@ -836,7 +886,7 @@
                      (String.Chars/to_string total) ", at " at "\n  " (short form))))
 
            :else
-           "  (the failing form could not be isolated: the source could not be re-read)")
+           "  (the failing form could not be isolated from the source location)")
          failure (if stacktrace
                    (Elixir.Exception/format :error e stacktrace)
                    (Elixir.Exception/format :error e))]
@@ -845,33 +895,25 @@
              where "\n\n" failure "\n")))))
 
 (defn- form_at_fault
-  "The form that raises, found by replaying the source. `:unknown` whenever
-   anything about the replay is not certain."
-  [ns path content]
-  (let [forms (read_forms content path)]
-    (if (and (loaded? :Elixir.BeamLisp.Ns.Reader)
-             (loaded? :Elixir.BeamLisp.Ns.Body.Compiler)
-             (erlang/is_list forms))
-      (let [total (erlang/length forms)
-            env (BeamLisp.Ns.Body.Compiler/new_env ns)
-            found
-            (with_load_path (Path/dirname path)
-              (fn []
-                (BeamLisp.Env/with_env :global
-                  (fn []
-                    (Enum/reduce_while
-                      (Enum/with_index forms 1)
-                      :none
-                      (fn [pair _acc]
-                        (let [form (erlang/element 1 pair)
-                              i (erlang/element 2 pair)
-                              env2 (maps/put :ns (BeamLisp.Env/current_ns) env)]
-                          (try
-                            (BeamLisp.Ns.Body.Compiler/eval_form form env2)
-                            (tuple :cont :none)
-                            (catch _e (tuple :halt (tuple :ok i total form)))))))))))]
-        (if (erlang/== :none found) :unknown found))
-      :unknown)))
+  "Attribute only an original stack location to reader metadata. Never execute
+   source for diagnostics; without a matching location the form stays unknown."
+  [path content stacktrace]
+  (try
+   (let [line (Enum/find_value (or stacktrace (list))
+               (fn [frame]
+                (when (and (erlang/is_tuple frame) (erlang/== 4 (erlang/tuple_size frame)))
+                 (let [location (elem frame 3) file (Keyword/get location :file)
+                       line (Keyword/get location :line)]
+                  (when (and file (erlang/is_integer line)
+                             (erlang/== (Path/expand (IO/chardata_to_string file)) (Path/expand path))) line)))))
+         forms (when line (read_forms content path))]
+    (if-not (and line (erlang/is_list forms)) :unknown
+     (Enum/reduce (Enum/with_index forms 1) :unknown
+      (fn [pair found]
+       (let [form (elem pair 0) at (node_line form)]
+        (if (and (erlang/is_integer at) (erlang/=< at line))
+         (tuple :ok (elem pair 1) (erlang/length forms) form) found))))))
+   (catch _ :unknown)))
 
 (defn- read_forms
   "Read every top-level form, or `nil` when the reader refuses the source."
@@ -1687,8 +1729,11 @@
 
 (defn shared_cache_root [kind]
  (let [xdg (library_environment "XDG_CACHE_HOME")
-       base (if (and (erlang/is_binary xdg) (erlang/not (erlang/== xdg "")))
-              xdg (Path/join (library_environment "HOME") ".cache"))]
+       home (library_environment "HOME")
+       absolute? (fn [path] (and (erlang/is_binary path) (erlang/not (erlang/== path ""))
+                                 (erlang/== :absolute (Path/type path))))
+       home (if (absolute? home) home (System/user_home!))
+       base (if (absolute? xdg) xdg (Path/join home ".cache"))]
   (Path/join (Path/join base "beam_lisp") kind)))
 
 (defn library_runtime_tag []

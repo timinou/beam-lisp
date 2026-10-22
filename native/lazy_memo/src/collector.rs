@@ -721,27 +721,50 @@ pub fn start() -> std::io::Result<()> {
     *lock(&START_ERROR) = "";
     let worker = std::thread::Builder::new()
         .name("beam-lisp-cycle-collector".into())
-        .spawn(|| loop {
-            let _ = layout(); // calibrate once, off the schedulers
-            {
-                let mut woken = lock(&WAKE.0);
-                while !*woken {
-                    woken = WAKE.1.wait(woken).unwrap_or_else(|p| p.into_inner());
+        .spawn(|| {
+            let mut settling = false;
+            loop {
+                let _ = layout(); // calibrate once, off the schedulers
+                {
+                    let mut woken = lock(&WAKE.0);
+                    while !*woken {
+                        if settling {
+                            // A threshold round can observe the last producer's
+                            // roots before its process exits. One delayed sweep
+                            // reclaims that tail even when no further allocations
+                            // arrive to cross another threshold. Idle collectors
+                            // do not poll, and shutdown still wakes immediately.
+                            let (guard, elapsed) = WAKE
+                                .1
+                                .wait_timeout(woken, std::time::Duration::from_millis(100))
+                                .unwrap_or_else(|p| p.into_inner());
+                            woken = guard;
+                            if elapsed.timed_out() {
+                                settling = false;
+                                break;
+                            }
+                        } else {
+                            woken = WAKE.1.wait(woken).unwrap_or_else(|p| p.into_inner());
+                        }
+                    }
+                    if *woken {
+                        settling = true;
+                    }
+                    *woken = false;
                 }
-                *woken = false;
-            }
-            if STOP.load(Ordering::Acquire) {
-                return;
-            }
-            if SCHEDULE.begin_round() {
-                wake();
-            }
-            if std::panic::catch_unwind(collect).is_err() {
-                ANOMALIES.fetch_add(1, Ordering::Relaxed);
-            }
-            let live = lock(registry()).len();
-            if SCHEDULE.finish_round(live, crate::accounted_retained_bytes()) {
-                wake();
+                if STOP.load(Ordering::Acquire) {
+                    return;
+                }
+                if SCHEDULE.begin_round() {
+                    wake();
+                }
+                if std::panic::catch_unwind(collect).is_err() {
+                    ANOMALIES.fetch_add(1, Ordering::Relaxed);
+                }
+                let live = lock(registry()).len();
+                if SCHEDULE.finish_round(live, crate::accounted_retained_bytes()) {
+                    wake();
+                }
             }
         });
     record_worker_start(worker);

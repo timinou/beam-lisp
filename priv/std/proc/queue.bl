@@ -416,6 +416,18 @@
 
 (defn- conn-key [srv] (tuple :bl-queue-conn (server-name srv)))
 
+(defn- scoped-store!
+ ;; Allocate through the actual SDK ETS producer so the opening receipt records
+ ;; this graph before effects. The SDK heir owns the returned physical table
+ ;; before Conn admission; request/dispatcher death cannot delete accepted jobs.
+ [srv]
+ (let [heir (table/ensure-heir!) store (store-ets/open (store-name srv))
+       tid (:table store)]
+  (ets/give_away tid heir (tuple :queue-store (server-name srv)))
+  (when-not (= heir (ets/info tid :owner))
+   (throw (ex-info "Queue table ownership transfer was not accepted" {:kind :queue-store-owner-unavailable})))
+  store))
+
 (declare attach-store!)
 
 (defn conn
@@ -434,7 +446,9 @@
       (BeamLisp.Env/with_generation_lock (tuple :queue-store (server-name srv))
        (fn []
         (or (erlang/apply :persistent_term :get (list (conn-key srv) nil))
-            (let [c (datom/connect-with (store-ets/adopt (ensure-store! srv)) SCHEMA)]
+            (let [store (if (Process/get :bl_generation) (scoped-store! srv)
+                          (store-ets/adopt (ensure-store! srv)))
+                  c (datom/connect-with store SCHEMA)]
               (erlang/apply :persistent_term :put (list (conn-key srv) c))
               c))))))
 
@@ -1994,15 +2008,20 @@
   borrow covers all handler modules before any user clock/contract/body runs."
  [handler action]
  (if-let [lease (:lease handler)]
-  (let [previous (BeamLisp.Env/capture)]
-   (try
-    (when (:environment handler) (BeamLisp.Env/bind (:environment handler)))
-    (let [result (BeamLisp.Env/run_code! lease
-                   #(BeamLisp.Env/with_owned_generation_execution (fn [] {:value (action)})))]
-     (when (= :cancelled result)
-      (throw (ex-info "Queue handler retention expired" {:kind :expired-queue-handler})))
-     (:value result))
-    (finally (BeamLisp.Env/bind previous))))
+  (let [context (:environment handler) generation (:generation context)
+        run (fn [] (BeamLisp.Env/with_owned_generation_execution (fn [] {:value (action)})))
+        result (if generation
+                 ;; Acceptance and context selection precede Source-labelled
+                 ;; ingress, including retained handlers from an older graph.
+                 (BeamLisp.Env/run_code_with_context! lease generation context run)
+                 (let [previous (BeamLisp.Env/capture)]
+                  (try
+                   (when context (BeamLisp.Env/bind context))
+                   (BeamLisp.Env/run_code! lease run)
+                   (finally (BeamLisp.Env/bind previous)))))]
+   (when (= :cancelled result)
+    (throw (ex-info "Queue handler retention expired" {:kind :expired-queue-handler})))
+   (:value result))
   (action)))
 
 (declare launch-selected!)
@@ -2190,9 +2209,10 @@
       st
       (do
         (let [entry (get (:running q) ref)
-              settlement (settle! st entry out)]
+              settlement (settle! st entry out)
+              public-settlement (if (= :expired-or-lost settlement) :lost settlement)]
           (emit-entry! entry :proc.queue/settled
-            (merge (:failure out {}) {:proc.queue/settlement settlement
+            (merge (:failure out {}) {:proc.queue/settlement public-settlement
                                      :proc.queue/outcome (if (contains? out :ok) :returned :raised)
                                      :proc.queue/attempt (:attempts entry)})))
         (assoc st :queue (assoc q :running (dissoc (:running q) ref)))))))

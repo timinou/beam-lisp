@@ -18,7 +18,7 @@
     # Keep the language's tested OTP/Elixir versions independent of nixpkgs defaults.
     # Both are built with the host pin's toolchain and glibc.
     otp-src = { url = "github:erlang/otp/OTP-29.0.1"; flake = false; };
-    elixir-src = { url = "github:elixir-lang/elixir/v1.20.2"; flake = false; };
+    elixir-src = { url = "github:elixir-lang/elixir/v1.20.4"; flake = false; };
   };
 
   outputs = { self, nixpkgs, nixpkgs-rust, otp-src, elixir-src }:

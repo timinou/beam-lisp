@@ -1,34 +1,82 @@
-;; Local Unix ownership, held by an OS descriptor rather than a timestamp.
-;; A port owns the helper's stdin. Owner/VM death closes it and releases flock.
-;; The persistent lock inode is NEVER unlinked. No caller-supplied shell text.
+;; Local ownership through the mandatory native file-lock descriptor. A small
+;; BEAM keeper retains the resource, follows its owner, and acknowledges release
+;; only after closing the descriptor. No shell or external lock utility is used.
+;; Persistent lock inodes are never unlinked.
 (ns os.lease)
-(defn release! [lease]
- (when-let [port (:port lease)]
-  (try (erlang/port_close port) (catch _ nil)))
- :ok)
+
+(defn- hold! [resource owner watch token]
+ (receive
+  [seen request caller :release] :when (= seen token)
+   (do (BeamLisp.LazyMemo/nif_file_unlock resource)
+       (erlang/unlink owner) (erlang/demonitor watch (list :flush))
+       (erlang/send caller [request :ok]))
+  [seen request caller [:transfer next]] :when (= seen token)
+   (if (and (erlang/is_pid next) (= (erlang/node next) (erlang/node)) (Process/alive? next))
+    (let [next-watch (erlang/monitor :process next)]
+     (when-not (= next owner) (erlang/link next) (erlang/unlink owner))
+     (erlang/demonitor watch (list :flush))
+     (erlang/send caller [request :ok])
+     (recur resource next next-watch token))
+    (do (erlang/send caller [request {:error :invalid-lease-owner}])
+        (recur resource owner watch token)))
+  [:DOWN ref _ _ _] :when (= ref watch) :ok
+  [:EXIT _ _] (recur resource owner watch token)))
+
+(defn- keeper! [path owner token]
+ (Process/flag :trap_exit true)
+ (erlang/link owner)
+ (let [watch (erlang/monitor :process owner)
+       r (try (BeamLisp.LazyMemo/nif_file_lock path false true)
+          (catch _ (tuple :error nil)))]
+  (if (= :ok (elem r 0))
+   (let [resource (elem r 1)]
+    (try
+     (erlang/send owner [token {:ok {:keeper (erlang/self) :token token :path path}}])
+     (hold! resource owner watch token)
+     (finally (BeamLisp.LazyMemo/nif_file_unlock resource))))
+   (erlang/send owner [token {:error (if (= :busy (elem r 0)) :busy :lease-unavailable)}]))))
+
 (defn acquire!
- "Nonblocking local filesystem lease. Busy/unsupported/error never grants
-  ownership. Requires util-linux flock and a POSIX shell on PATH; no FHS /bin helpers."
+ "Take a nonblocking local filesystem lease. Owner or VM death releases it;
+  a paused owner retains it. Works with the shipped native runtime on Unix."
  [path]
- (let [executable (System/find_executable "flock")
-       shell (System/find_executable "sh")]
- (if (and executable shell)
+ (BeamLisp.LazyMemo/ensure_loaded!)
+ (let [path (Path/expand path (BeamLisp/cwd)) token (erlang/make_ref)
+       owner (erlang/self)
+       child (erlang/spawn_monitor (fn [] (keeper! path owner token)))
+       keeper (elem child 0) watch (elem child 1)]
   (try
-   (let [port (erlang/open_port (tuple :spawn_executable (String/to_charlist executable))
-                (list :binary :exit_status :use_stdio
-                  (tuple :args (list "--no-fork" "--nonblock" "--" path
-                     shell "-c" "printf 'leased\\n'; while IFS= read -r line; do :; done"))))]
-    (receive
-     [p [:data "leased\n"]] :when (= p port) {:ok {:port port :path path}}
-     [p [:exit_status status]] :when (= p port) {:error (if (= status 1) :busy [:helper-exit status])}
-     (after 1000 (do (release! {:port port}) {:error :lease-timeout}))))
-   (catch e {:error :lease-unavailable}))
-  {:error :lease-unsupported})))
-(defn transfer! [lease owner]
- "Transfer lifetime to the endpoint owner. Failure grants no ownership."
- (erlang/port_connect (:port lease) owner)
- (when (not= owner (erlang/self)) (erlang/unlink (:port lease)))
- lease)
+   (receive
+    [seen result] :when (= seen token) result
+    [:DOWN ref _ _ _] :when (= ref watch) {:error :lease-unavailable}
+    (after 5000 (do (erlang/unlink keeper) (erlang/exit keeper :kill) {:error :lease-timeout})))
+   (finally (erlang/demonitor watch (list :flush))))))
+
+(defn- control! [lease operation]
+ (let [keeper (:keeper lease) request (erlang/make_ref)
+       watch (erlang/monitor :process keeper)]
+  (try
+   (erlang/send keeper [(:token lease) request (erlang/self) operation])
+   (receive
+    [ref result] :when (= ref request) result
+    [:DOWN ref _ _ _] :when (= ref watch) :closed
+    (after 5000 {:error :lease-timeout}))
+   (finally (erlang/demonitor watch (list :flush))))))
+
+(defn release! [lease]
+ (when (:keeper lease)
+  (let [r (control! lease :release)]
+   (when-not (contains? #{:ok :closed} r)
+    (throw (ex-info "Lease release failed" r)))))
+ :ok)
+
+(defn transfer!
+ "Transfer lifetime to a local owner, acknowledging its monitor before return."
+ [lease owner]
+ (let [r (control! lease [:transfer owner])]
+  (when-not (= :ok r) (throw (ex-info "Lease transfer failed" {:result r})))
+  lease))
+
 (defn with-lease [path action]
  (let [r (acquire! path)]
   (if-let [lease (:ok r)]

@@ -109,19 +109,6 @@ below reads those, and `lint-source` and `smell-count` count both kinds.
       (= tag :keyword) (keyword (reader-node/node-name f))
       :else            f)))
 
-(defn- subnodes-with-pos
-  "Every node of `n` paired with the source position it starts at, itself
-   included, depth-first. Descends list and vector nodes — the same surface
-   `deodorant/scan` walks — and gives a child without its own span the nearest
-   enclosing one, so a smell always reports the line of the form it sits in."
-  [n pos]
-  (let [tag (reader-node/node-tag (reader-node/node-form n))
-        here (or (reader-node/node-pos n) pos)]
-    (cons [n here]
-          (if (contains? #{:list :vector} tag)
-            (mapcat (fn [c] (subnodes-with-pos c here)) (reader-node/node-items n))
-            []))))
-
 (defn- line-of
   "The 1-based line of a position map, or 0 when the node carries no span."
   [pos]
@@ -209,25 +196,30 @@ sweep; a linter reports what it can read and keeps going.
                text-rules))))))
 
 (defn lint-source
-  "Every smell in one source text under `rules`: `{:path :smells [...]}`. Walks
-   each node of every top-level form for the FORM rules — the same surface and
-   count as `deodorant/report-source` — and reads the source once for the TEXT
-   rules, which have no form to match. Both kinds land in one list, in source
-   order."
+  "Convert each top-level reader tree once, then walk its data and positions
+   together. Matching a child never reconverts its entire subtree."
   [rules path src]
   (let [forms (BeamLisp.Reader/read_string src)
-        smells-at
-        (fn [node]
-          (let [pos (second node)]
-            (try
-              (let [form (node->data (first node))]
-                (map (fn [rule] (smell rule form pos))
-                     (deodorant/matches rules form)))
-              (catch _ []))))
-        found (into [] (mapcat smells-at (mapcat (fn [n] (subnodes-with-pos n nil)) forms)))]
-    {:path path
-     :smells (vec (sort-by (fn [s] (:line s))
-                           (concat found (text-smell-entries rules src))))}))
+        prepared (deodorant/prepare-rules rules)
+        roots (mapv (fn [n] [n (node->data n) nil]) forms)
+        found (loop [pending (vec (reverse roots)) found []]
+                (if (empty? pending) found
+                  (let [[node form inherited] (peek pending)
+                        pos (or (reader-node/node-pos node) inherited)
+                        tag (reader-node/node-tag (reader-node/node-form node))
+                        kids (if (contains? #{:list :vector} tag)
+                               (mapv (fn [n f] [n f pos]) (reader-node/node-items node) form) [])
+                        at (try (mapv (fn [r] (smell r form pos))
+                                      (deodorant/matches-prepared prepared form))
+                                (catch _ []))]
+                    (recur (into (pop pending) (reverse kids)) (into found at)))))]
+    {:path path :smells (vec (sort-by :line (concat found (text-smell-entries rules src))))}))
+
+(defn smell-count-forms
+  "Smell count sharing a diagnostic request's parsed reader forms."
+  [rules src forms]
+  (+ (count (text-smell-entries rules src))
+     (reduce + 0 (vals (deodorant/report-forms rules (map node->data forms))))))
 
 (defn smell-count
   "How many smells `src` holds under `rules` — the count without the positions,

@@ -5,6 +5,7 @@
  (:require [env] [source-graph :as graph] [reader-node :as rn]
            [reader :as reader] [reload.static-call :as static-call]
            [reload.native-call :as native-call] [reload.source-producer :as source-producer] [reload.registry-data :as registry-data]
+           [reload.sdk-readiness :as sdk-readiness] [reload.initializer :as initializer]
            [reload.binding-data :as binding-data] [reload.execution :as execution]
            [reload.declaration :as declaration] [reload.generated-class :as generated-class]
            [reload.syntax-constructor :as syntax-constructor] [reload.macro-source :as macro-source]
@@ -591,7 +592,8 @@
                        (if (contains? #{"Agent" "Process" "GenServer" "Kernel"} module) (str "Elixir." module) module))) :utf8)
                 (catch _ nil))
        function (try (erlang/binary_to_existing_atom name :utf8) (catch _ nil))]
-  (or (and target function (BeamLisp.Env/source_critical_target? target function))
+  (or (unmanaged-producer? namespace name)
+      (and target function (BeamLisp.Env/source_critical_target? target function))
       ;; Firstparty SDK producer identities are checked separately, before
       ;; Source namespace rewriting. Native ABI policy lives only in Env.
       (contains? (get STORE-PRODUCERS namespace #{}) name)
@@ -628,15 +630,23 @@
                        (= "invoke" function))))
     (refuse! :unmanaged-compiled-producer {:namespace name :symbol symbol})))))
 
+(defn- compiler-data-target? [module function arity]
+ ;; Audited macros emit these bounded-arity spec constructors. Raw Source
+ ;; spellings still require their original native grant before expansion.
+ (source-producer/compiler-data-call? module function arity))
+
 (defn- compile-exact [planned form env]
  (syntax-constructor/with-expansion! (fn []
   (let [native (native-call/specialize
-                (declaration/specialize-registrations! (BeamLisp.Compiler/compile form env))
-                (fn [{:keys [module function]}]
+                (declaration/specialize-registrations! (BeamLisp.Compiler/compile form (assoc env :managed-source true)))
+                (fn [{:keys [module function arity]}]
                  (let [name (String/replace_prefix (erlang/atom_to_binary module :utf8) "Elixir." "")]
-                  (when-not (contains? (:native-modules planned) name)
+                  (when-not (or (contains? (:native-modules planned) name)
+                                (compiler-data-target? module function arity)
+                                (source-producer/compiler-runtime-call? module function arity))
                    (refuse! :undeclared-native-target {:module name :function function}))
-                  (when (native-hazard? module function)
+                  (when (and (native-hazard? module function)
+                             (not (source-producer/compiler-runtime-call? module function arity)))
                    (refuse! :unmanaged-compiled-producer {:module module :function function})))))
         target (:source-http-target planned)]
    (:expression (source-producer/specialize (:expression native)
@@ -720,6 +730,13 @@
                        namespace (first (String/split reference "/"))]
                   (when-not (contains? (:mapping planned) namespace)
                    (refuse! :unsealed-late-binding {:namespace namespace})))))
+               ;; Audit delayed child factories too. A supervisor descriptor
+               ;; itself is inert; its generated function must still carry a
+               ;; bounded pool before startup can materialize worker specs.
+               (when (and (= :remote (:op node)) (sdk-pool-data-target? node))
+                (let [size (nth (:args node) 2)]
+                 (when-not (and (= :lit (:op size)) (integer? (:val size)) (<= 1 (:val size) 4095))
+                  (refuse! :effectful-generation {:reason :unbounded-managed-pool}))))
                (when (unmanaged-store-binding? node)
                 (refuse! :unmanaged-compiled-producer {:namespace (:ns node) :function (:name node)}))
                (when (or (reflective-global? node)
@@ -731,6 +748,7 @@
                (when (and (= :remote (:op node)) (erlang/is_atom (:mod node))
                           (native-hazard? (:mod node) (:fun node))
                           (not (authorized-system-bridge? planned node))
+                          (not (source-producer/compiler-runtime-call? (:mod node) (:fun node) (count (:args node))))
                           (not (and (= :with_source_execution! (:fun node))
                                     (= :Elixir.BeamLisp.Env (:mod node))
                                     (= 1 (count (:args node)))
@@ -745,7 +763,9 @@
                 (refuse! :unmanaged-compiled-producer {:module (:mod node) :function (:fun node)}))
                (when (and (= :remote (:op node)) (= :Elixir.BeamLisp.Env (:mod node))
                           (= :invoke_source_native! (:fun node)))
-                (let [target (first (:args node)) function (second (:args node))]
+                (let [target (first (:args node)) function (second (:args node))
+                      arguments (native-call/checked-arguments (nth (:args node) 2))
+                      original {:op :remote :mod (:val target) :fun (:val function) :args arguments}]
                  (when (or (not= :lit (:op target)) (not= :lit (:op function))
                            (BeamLisp.Env/source_critical_target? (:val target) (:val function)))
                   (refuse! :unmanaged-compiled-producer {:module (:val target) :function (:val function)}))
@@ -755,18 +775,31 @@
                   (when (or (= :refuse status)
                             (and (= :external status) (not (contains? modules (:val target)))
                                  (not (contains? (:native-modules planned) native-name))))
-                   (refuse! :undeclared-native-target {:module (:val target) :function (:val function)})))))
+                   (refuse! :undeclared-native-target {:module (:val target) :function (:val function)})))
+                 ;; The fixed wrapper is an execution restriction, not a new
+                 ;; semantic target. Audit the exact original call with EVERY
+                 ;; ordinary rule (late bindings, reflection, readiness, pools).
+                 ;; Traverse these operands once, rather than both IR views.
+                 (walk original)))
                (when (and (= :remote (:op node)) (= :Elixir.BeamLisp.Loader (:mod node))
                           (not (and (= :ensure_ready (:fun node)) (= 1 (count (:args node)))
                                     (= :lit (:op (first (:args node))))
                                     (contains? names (:val (first (:args node)))))))
-                (refuse! :unsealed-compiled-dependency {:module (:mod node) :function (:fun node)}))
+                (refuse! :unsealed-compiled-dependency {:module (:mod node) :function (:fun node) :arguments (:args node)}))
                (when (and (= :remote (:op node)) (erlang/is_atom (:mod node))
                           (String/starts_with? (erlang/atom_to_binary (:mod node) :utf8)
                                                "Elixir.BeamLisp.Ns.")
                           (not (contains? modules (:mod node))))
                 (refuse! :unsealed-compiled-dependency {:module (:mod node)}))
-               (when-not (= :lit (:op node)) (doseq [child (vals node)] (walk child))))
+               ;; These are actual checked binding reads/readiness guards,
+               ;; not quoted source data or the entire permitted boundary.
+               (when-let [readiness (:sdk-readiness planned)]
+                (when-let [reference (sdk-readiness/reference node)]
+                 (swap! readiness conj reference)))
+               (when-not (or (= :lit (:op node))
+                             (and (= :remote (:op node)) (= :Elixir.BeamLisp.Env (:mod node))
+                                  (= :invoke_source_native! (:fun node))))
+                (doseq [child (vals node)] (walk child))))
              (erlang/is_tuple node) (doseq [child (erlang/tuple_to_list node)] (walk child))
              (or (list? node) (vector? node)) (doseq [child node] (walk child))))]
    (walk expression))))
@@ -789,13 +822,36 @@
          [_ entries] (BeamLisp.Env/ns_defs name) entry entries]
   (check-anf! planned (elem entry 3))))
 
+(defn- prepare-sdk-readiness! [planned]
+ ;; Source callbacks cannot initialize/detach SDK code. Complete only the
+ ;; fixed SDK bindings referenced by checked executable IR, in native
+ ;; preparation and global SDK lifetime. No application initializer runs here.
+ (sdk-readiness/prepare! @(:sdk-readiness planned)))
+
 (def ^:private immutable-remotes
- #{[:Elixir.BeamLisp.Supervisor :server]
-   ;; Forcing native constructors require bounded first-order input below.
+ #{;; Forcing native constructors require bounded first-order input below.
    [:Elixir.BeamLisp.Ns.Rt :hash_key] [:Elixir.BeamLisp.Ns.Clojure.Re :re-pattern]
    [:Elixir.BeamLisp.Ns.Core :merge__bl_v]
+   [:Elixir.BeamLisp.Ns.Core :inc] [:Elixir.BeamLisp.Ns.Core :dec]
    [:Elixir.BeamLisp.Ns.Core :vector__bl_v] [:Elixir.BeamLisp.Ns.Core :list__bl_v]
    [:Elixir.BeamLisp.Ns.Core :str__bl_v] [:Elixir.Regex :compile!]})
+
+(defn- sdk-pool-data-target? [node]
+ ;; The ordinary SDK pool adapter constructs data and starts nothing. Match
+ ;; its actual fixed binding and immutable SDK bytes, never a spelling alone.
+ ;; A pool has a dispatcher as well as workers; the managed tree admits at
+ ;; most 4096 children. Refuse a huge constructor before materializing it.
+  (and (= :pool-spec (:fun node)) (= 3 (count (:args node)))
+       (some (fn [entry]
+               (and (= :fixed (elem entry 0)) (= 3 (elem entry 1))
+                    (= (:fun node) (elem entry 2))
+                    (or (= (:mod node) (BeamLisp.Emit/module_for "proc.super"))
+                        (and (> (erlang/tuple_size entry) 4) (= (:mod node) (elem entry 4))))))
+             (BeamLisp.Env/ns_definition "proc.super" "pool-spec"))
+       ;; A canonical SDK binding may compile through its mutable forwarder.
+       ;; Authenticate the complete selected unit; an external shim fun is not
+       ;; itself a canonical SDK callback value.
+       (BeamLisp.AOT/sdk_unit_compiled? "proc.super")))
 
 (defn- record-factory! [targets namespace definition]
  ;; Incremental per-definition index: do not materialize/rescan the whole
@@ -828,7 +884,7 @@
              (and (every? #(= :pvar (:pop %)) params)
                   (let [locals (reduce (fn [out param] (assoc out (:name param) :immutable)) bindings params)]
                    (and (or (nil? (:guard clause)) (safe (:guard clause) locals active (inc depth)))
-                        (safe (:body clause) locals active (inc depth)))))))
+                        (safe (source-producer/initialization-body (:body clause)) locals active (inc depth)))))))
           (call-local? [callee arguments bindings active depth]
             (let [value (when (= :var (:op callee)) (get bindings (:name callee)))
                   closure (cond (= :fn (:op callee)) {:node callee :bindings bindings}
@@ -837,9 +893,21 @@
                                                  (:clauses (:node closure))))]
              (and (seq clauses) (every? #(safe % bindings active (inc depth)) arguments)
                   (every? #(clause-safe? % (:bindings closure) active (inc depth)) clauses))))
+          (pattern-bindings [pattern bindings depth]
+           ;; Literal native apply specialization matches its evaluated proper
+           ;; argument list before calling the exact target. Prove this finite
+           ;; data pattern without evaluating the constructor during analysis.
+           (budget! depth)
+           (case (:pop pattern)
+            :pvar (when (string? (:name pattern)) (assoc bindings (:name pattern) :immutable))
+            :pnil bindings
+            :pcons (when-let [head (pattern-bindings (:head pattern) bindings (inc depth))]
+                     (pattern-bindings (:tail pattern) head (inc depth)))
+            nil))
           (safe [n bindings active depth]
            (budget! depth)
            (if-not (map? n) false
+            (let [n (or (native-call/original-source-call n) n)]
             (case (:op n)
              :lit true :enil true
              :global (let [found (BeamLisp.Env/fetch (:ns n) (:name n))]
@@ -854,6 +922,12 @@
                                                  {:node (:init n) :bindings bindings} :immutable))
                       active (inc depth)))
              :apply (call-local? (:fn n) (:args n) bindings active depth)
+             :case (and (safe (:subj n) bindings active (inc depth)) (seq (:clauses n))
+                      (every? (fn [clause]
+                        (and (= 1 (count (:pats clause)))
+                         (when-let [locals (pattern-bindings (first (:pats clause)) bindings (inc depth))]
+                          (and (or (nil? (:guard clause)) (safe (:guard clause) locals active (inc depth)))
+                               (safe (source-producer/initialization-body (:body clause)) locals active (inc depth)))))) (:clauses n)))
              :if (every? #(safe % bindings active (inc depth)) [(:test n) (:then n) (:else n)])
              :map (every? #(every? (fn [v] (safe v bindings active (inc depth))) %) (:pairs n))
              :cons (and (safe (:head n) bindings active (inc depth)) (safe (:tail n) bindings active (inc depth)))
@@ -864,7 +938,20 @@
              :remote
               (let [target [(:mod n) (:fun n) (count (:args n))] clause (get targets target)]
                (cond
-                (contains? immutable-remotes [(:mod n) (:fun n)])
+                (= :literal-set (get (:immutable-collection-targets planned) target))
+                 ;; A literal set may sit beside delayed callbacks in a value
+                 ;; initializer. Prove its own proper eager input; a whole-map
+                 ;; data proof would reject the callbacks, while a generic
+                 ;; Enumerable allowance could execute application code.
+                 (collection-constructor/proved? n
+                  {:sdk (:immutable-collection-targets planned)
+                   :factories targets :allowed-globals (set (vals (:mapping planned)))})
+                (sdk-pool-data-target? n)
+                 (let [size (nth (:args n) 2)]
+                  (and (= :lit (:op size)) (integer? (:val size)) (<= 1 (:val size) 4095)
+                       (every? #(safe % bindings active (inc depth)) (:args n))))
+                (or (contains? immutable-remotes [(:mod n) (:fun n)])
+                    (compiler-data-target? (:mod n) (:fun n) (count (:args n))))
                  (every? #(safe % bindings active (inc depth)) (:args n))
                 (and (= :Elixir.BeamLisp.Loader (:mod n)) (= :ensure_ready (:fun n))
                      (= 1 (count (:args n))) (= :lit (:op (first (:args n)))))
@@ -875,7 +962,7 @@
                       (every? #(clause-safe? % {} (conj active target) (inc depth)) clause))
                 :else false))
              :do (every? #(safe % bindings active (inc depth)) (:stmts n))
-             false)))]
+             false))))]
    (safe node {} #{} 0))))
 
 (defn- executable-values [value]
@@ -917,6 +1004,7 @@
              (if (contains? #{"defn" "defn-" "defmacro" "def" "defserver" "defrecord" "deftype"} head)
              (let [definition (name-of (second items))
                    compiled (compile-exact planned form env)
+                   evaluated (atom compiled)
                    class (when (contains? #{"defrecord" "deftype"} head)
                            (generated-class/class! compiled name definition
                              (if (= "defrecord" head) :record :deftype)
@@ -926,8 +1014,6 @@
               (when (or (nil? definition) (contains? @seen definition))
                (refuse! :duplicate-definition {:namespace name :definition definition}))
               (swap! seen conj definition)
-              (when (= head "defmacro")
-               (syntax-constructor/macro! (definition-initializer compiled name definition)))
               (when (= head "def")
                (let [initializer (definition-initializer compiled name definition)]
                 (check-anf! planned initializer)
@@ -937,7 +1023,13 @@
                                 :factories (:entries @factory-targets)
                                 :factory-globals (:globals @factory-targets)
                                 :allowed-globals (set (vals (:mapping planned)))}))
-                 (refuse! :effectful-generation {:namespace name :definition definition}))))
+                 (refuse! :effectful-generation {:namespace name :definition definition}))
+                (let [inlined (initializer/inline initializer (assoc @factory-targets :sdk (:immutable-collection-targets planned)))
+                      registration (if (= :let (:op compiled)) (:init compiled) compiled)
+                      registration (assoc registration :args
+                                     (to-list (assoc (vec (:args registration)) 2 inlined)))]
+                 (check-anf! planned inlined)
+                 (reset! evaluated (if (= :let (:op compiled)) (assoc compiled :init registration) registration)))))
               (when (= head "defserver")
                (let [descriptor (:val (first (:args (first (:stmts compiled)))))]
                 (when-not (and (= :module (:op descriptor))
@@ -946,9 +1038,12 @@
                 (doseq [clause (:clauses descriptor)]
                  (check-anf! planned (:body (server-entry/input-body (:name descriptor) clause))))
                 (swap! (:server-descriptors planned) assoc (:name descriptor) descriptor)))
-              (let [value (evaluate-exact! compiled)]
-               (when (= head "defmacro")
-                (BeamLisp.Env/intern name definition (syntax-constructor/guard-macro value)))
+              (let [value (if (= head "defmacro")
+                            (syntax-constructor/guard-macro
+                             (syntax-constructor/macro-value!
+                              (definition-initializer compiled name definition)))
+                            (evaluate-exact! @evaluated))]
+               (when (= head "defmacro") (BeamLisp.Env/intern name definition value))
                (when (contains? #{"defn" "defn-"} head) (record-factory! factory-targets name definition))
                (when (= head "defserver")
                 (when-not (= (BeamLisp.Server/module_for name definition) value)
@@ -1023,7 +1118,11 @@
                  (erlang/function_exported :Elixir.BeamLisp.Env :source_with_env! 2)
                 (erlang/function_exported :Elixir.BeamLisp.Env :invoke_source_native! 3)
                 (erlang/function_exported :Elixir.BeamLisp.Env :source_target_declaration! 3)
-                (erlang/function_exported :Elixir.BeamLisp.Env :register_source_profile! 1))
+                (erlang/function_exported :Elixir.BeamLisp.Env :register_source_profile! 1)
+                (erlang/function_exported :Elixir.BeamLisp.Env :run_code_with_context! 4)
+                (erlang/function_exported :Elixir.BeamLisp.Env :code_callback_active? 2)
+                (erlang/function_exported :Elixir.BeamLisp.Env :register_code_callback! 2)
+                (erlang/function_exported :Elixir.BeamLisp.Env :run_code_callback! 3))
   (refuse! :native_source_extent_unavailable {}))
  (let [input (or (:input proposal) proposal)
        validation (plan-with-facts* input nil)
@@ -1037,12 +1136,14 @@
                           :forbidden-remotes (forbidden-remotes)
                           ;; Capture SDK identities before entering the child application env.
                           :immutable-collection-targets (collection-constructor/sdk-targets)
-                          :reconcile-sdk-context (reconcile-compiler/sdk-context)
                           :source-http-target (source-http-target)
                           :module-inventory-cache (atom {:entries {} :hits 0 :scans 0})
+                          :sdk-readiness (atom #{})
+                          :compiler-observations (atom {})
                           :generated-classes (atom #{})
                           :server-classes (atom #{})
                           :server-descriptors (atom {}))
+           parent-scope (env/current)
            scope (env/fork) value-modules (atom #{}) factory-targets (atom {:entries {} :globals {}}) callables (atom {}) generation
            (try
             (env/with-env scope
@@ -1067,10 +1168,15 @@
                (let [fresh (get (:mapping planned) name)]
                 (evaluate-definitions! planned fresh (get (:sources planned) fresh) value-modules factory-targets)
                 (BeamLisp.Env/mark_loaded fresh)))
-              (let [bridge (reconcile-compiler/finalize! planned @factory-targets (:reconcile-sdk-context planned))
+              (declaration/prove-clause-transforms!)
+              (let [sdk-context (when (seq (declaration/canonical-captures))
+                                  (env/with-env parent-scope #(reconcile-compiler/sdk-context)))
+                    bridge (reconcile-compiler/finalize! planned @factory-targets sdk-context)
                     checked-planned (assoc planned :compiler-namespaces (conj (set (:runtime-namespaces bridge)) "reload.source-guard"))]
+               (reset! (:compiler-observations planned) (select-keys bridge [:canonical-count :produced-v2 :retained]))
                (BeamLisp.Link/settle)
-               (check-compiled! checked-planned))
+               (check-compiled! checked-planned)
+               (prepare-sdk-readiness! checked-planned))
               (registry-data/check-fields! (:registries planned))
               (doseq [reference (mapcat binding-data/references (vals (:sources (:input planned))))]
                (let [[logical definition] (String/split reference "/")
@@ -1112,6 +1218,7 @@
                 :actor-inputs actor-inputs
                 :registries (:registries planned) :declarations declarations :callables @callables
                 :preparation-metrics (select-keys @(:module-inventory-cache planned) [:hits :scans])
+                :compiler-observations @(:compiler-observations planned)
                 :state (atom {:retired false :tickets {} :slots #{}}) :cache-key key})))))
             (catch error
              (try
@@ -1240,13 +1347,13 @@
  (let [declared (get-in generation [:resources :dynamic-store-policy])
        loaded? (env/with-env :global #(BeamLisp.Env/ns_ready? "datom.conn"))
        installed? (when loaded?
-          ((env/with-env :global #(BeamLisp.AOT/sdk_named_constructor! "datom.conn" "migration-policy-installed?" 1))
+          ((BeamLisp.Env/sdk_callable! "datom.conn" "migration-policy-installed?" 1)
              (:application-id generation)))]
   (when (and installed? (nil? declared)) (refuse! :migration-policy-declaration-required {}))
   (if declared
    (execution/with! generation
     (fn []
-     ((env/with-env :global #(BeamLisp.AOT/sdk_named_constructor! "datom.conn" "with-migration-publication-reservation!" 1)) action)))
+     ((BeamLisp.Env/sdk_callable! "datom.conn" "with-migration-publication-reservation!" 1) action)))
    (action))))
 
 (defn publish!
@@ -1382,12 +1489,19 @@
  "Invoke an entrypoint under a retained registration, or :cancelled after
   release/owner death. Does not serialize independent callback executions."
  [registration entry args]
- (let [generation (:generation registration)]
-  (BeamLisp.Env/run_code! (:ticket registration)
-   (fn []
-    (let [ticket (acquire! generation)]
-     (try (execute generation (fn [] (invoke-entry generation entry args)) ticket)
-          (finally (release-ticket! generation ticket))))))))
+ (let [generation (:generation registration) handle (:ticket registration)]
+  (if-not (BeamLisp.Env/code_lease_active? handle) :cancelled
+   (do
+    ;; Public graph edits cannot choose a native callback context. A cancelled
+    ;; ticket may race this read; only its native accepting lease grants entry.
+    (try (attested-prepared! generation true)
+     (catch error
+      (when (BeamLisp.Env/code_lease_active? handle) (throw error))))
+    (BeamLisp.Env/run_code_with_context! handle generation (:context generation)
+     (fn []
+      (let [ticket (acquire! generation)]
+       (try (execute generation (fn [] (invoke-entry generation entry args)) ticket)
+            (finally (release-ticket! generation ticket))))))))))
 
 (defn release! [registration]
  (release-ticket! (:generation registration) (:ticket registration)))
@@ -1422,9 +1536,8 @@
 (defn- queue-root-retirement [generation operation]
  ;; Fixed SDK exact definition receipt, never a user callback/namespace prefix.
  ;; Optional lazy seam avoids eager generation <-> queue module dependency.
- (when (env/with-env :global #(BeamLisp.Env/loaded_ns? "proc.queue-family-root"))
-  (let [f (env/with-env :global
-     #(BeamLisp.AOT/sdk_named_constructor! "proc.queue-family-root" operation 1))]
+ (when (BeamLisp.Env/loaded_ns? "proc.queue-family-root")
+  (let [f (BeamLisp.Env/sdk_callable! "proc.queue-family-root" operation 1)]
    (f generation))))
 
 (defn- retirement-key [generation]
@@ -1553,9 +1666,8 @@
 
 (defn- conn-retirement [generation]
  ;; Optional exact SDK producer receipt; no supplied callback or eager import.
- (when (env/with-env :global #(BeamLisp.Env/loaded_ns? "reload.conn-retention"))
-  (let [f (env/with-env :global
-            #(BeamLisp.AOT/sdk_named_constructor! "reload.conn-retention" "release-retired!" 1))]
+ (when (BeamLisp.Env/loaded_ns? "reload.conn-retention")
+  (let [f (BeamLisp.Env/sdk_callable! "reload.conn-retention" "release-retired!" 1)]
    (f generation))))
 
 (defn- retirement-step! [generation stage action]

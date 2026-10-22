@@ -540,9 +540,10 @@
    (so `core/not` is the var `not` in ns `core`, not a call to a `core`
    module), and finally a lowercase unknown prefix is an Erlang module."
   [env name]
-  (let [[prefix member] (split-slash name)
-        prefix (if (= "clojure.core" prefix) "core" prefix)
-        alias (BeamLisp.Env/alias_target (:ns env) prefix)]
+  (let [[written-prefix member] (split-slash name)
+        canonical-core? (= "clojure.core" written-prefix)
+        prefix (if canonical-core? "core" written-prefix)
+        alias (when-not canonical-core? (BeamLisp.Env/alias_target (:ns env) prefix))]
     (cond
       ; an alias or an existing beam-lisp namespace resolves to a VAR — not a
       ; host escape — so it is never capability-gated.
@@ -1085,6 +1086,15 @@
             path (js-path (if ctor (subs name 0 (dec (count name))) name) env)]
         (assoc (js-node (if ctor :new :call) (compile-each-notail args env) env) :path path))))
 
+(defn- server-return-call [shape arguments]
+ ;; Ordinary calls evaluate these arguments right-to-left. Bind explicitly:
+ ;; destructuring a temporary list lets Core optimization reorder its effects.
+ (if (empty? arguments) (a/lit (elem shape 0))
+  (let [names (Enum/map arguments (fn [_] (fresh-var "return_arg")))
+        result (a/tup (cons (a/lit (elem shape 0)) (Enum/map names (fn [name] (a/var name)))))]
+   (Enum/reduce (Enum/zip names arguments) result
+     (fn [pair body] (a/lett (elem pair 0) (elem pair 1) body))))))
+
 (defn- compile-call
   "Turn a call form (head arg ...) into the tree that runs it.
 
@@ -1229,12 +1239,15 @@
                   local-node (compile-symbol name env)
                   direct (if (erlang/== :error lo)
                            nil
-                           (linked-call (erlang/element 3 lo) arg-nodes env))]
+                           (linked-call (erlang/element 3 lo) arg-nodes env))
+                  constructor (get-in local-node [:ann :server-return-constructor])]
+              (if (and constructor (some #(= (count arg-nodes) %) (elem constructor 1)))
+                (server-return-call constructor arg-nodes)
               (if (some? direct)
                 (a/iff (a/remote (kernel-mod-rt-literal) :invocable? (list local-node (a/lit (count arg-nodes))))
                        (anf-invoke local-node arg-nodes)
                        (ready-guard (erlang/element 2 lo) direct env))
-                (anf-invoke local-node arg-nodes)))
+                (anf-invoke local-node arg-nodes))))
             (let [lo (BeamLisp.Env/link_owner (:ns env) (core-qualified name))
                   direct (if (erlang/== :error lo)
                            nil
@@ -1271,7 +1284,7 @@
    `proc/defserver`) are real code, so this is a warning, not an error. Written
    to stderr once per definition. `kind` is the defining form (`defn`, …)."
   [kind name env]
-  (when (and (erlang/is_binary name) (contains? special-forms name)
+  (when (and (erlang/is_binary name) (contains? (kernel-special-forms-literal) name)
              ; the toolchain's own qualified-only definitions (`anf/var`,
              ; `multi/satisfies?`, `proc/defserver`) are known and intended
              (not (contains? #{"anf" "proc" "proc.server" "host.multi" "host.emit"} (:ns env))))
@@ -2258,18 +2271,18 @@
             base))
       (= tag :symbol) form
       (= tag :keyword) (erlang/binary_to_atom (rn/node-name form))
-      (= tag :list) (apply list (map (fn [value] (datum value)) (rn/node-items form)))
-      (= tag :vector) (BeamLisp.Vector/new (apply list (map (fn [value] (datum value)) (rn/node-items form))))
-      (= tag :set) (BeamLisp.Set/new (apply list (map (fn [value] (datum value)) (rn/node-items form))))
+      (= tag :list) (Enum/map (rn/node-items form) (fn [value] (datum value)))
+      (= tag :vector) (BeamLisp.Vector/new (Enum/map (rn/node-items form) (fn [value] (datum value))))
+      (= tag :set) (BeamLisp.Set/new (Enum/map (rn/node-items form) (fn [value] (datum value))))
       (= tag :map)
         ; build a plain map value from the key/value data; :maps.from_list
         ; takes a list of {k, v} tuples, which is what each pair becomes
         (maps/from_list
-          (apply list (map (fn [pair]
-                             (let [kv (erlang/tuple_to_list pair)]
-                               (erlang/list_to_tuple
-                                 (list (datum (first kv)) (datum (second kv))))))
-                           (rn/node-items form))))
+          (Enum/map (rn/node-items form)
+            (fn [pair]
+              (let [kv (erlang/tuple_to_list pair)]
+                (erlang/list_to_tuple
+                  (list (datum (first kv)) (datum (second kv))))))))
       :else form)))
 
 (defn- compile-quote
@@ -2874,7 +2887,8 @@
             ; materialize a `^:per-env` value — only test whether it binds.
             r (BeamLisp.Env/peek ns name)]
         (if (and (erlang/is_tuple r) (= :ok (erlang/element 1 r)))
-          (str (owner-ns ns name) "/" name)
+          (let [owner (owner-ns ns name)]
+            (str (if (= owner "core") "clojure.core" owner) "/" name))
           name))))
 
 (defn- unquote-form?
@@ -3393,16 +3407,25 @@
 ; ---- defserver (real gen_server) ---------------------------------------------
 ;
 ; (defserver name (init [arg] body) (handle-call PAT [from state] body) ...)
+(defn- server-constructor-node [shape]
+ (let [tag (elem shape 0) arities (elem shape 1)
+       fixed (a/mapp (Enum/map arities
+               (fn [arity]
+                (let [names (Enum/map (lists/seq 1 arity) (fn [_] (fresh-var "return")))
+                      body (if (= 0 arity) (a/lit tag)
+                             (a/tup (cons (a/lit tag) (Enum/map names (fn [name] (a/var name))))))]
+                 (list (a/lit arity)
+                       (a/fnn (list (a/clause (Enum/map names (fn [name] (a/pvar name))) nil body))))))))]
+  (assoc (a/tup (list (a/lit :"$blfn") fixed (a/lit nil)))
+         :ann {:server-return-constructor shape})))
+
 (defn- server-body
-  "Compile a callback body with OTP return constructors bound as locals."
+  "Compile callbacks against the shared pure return-constructor model.
+   Ordinary calls emit tuples; first-class captures remain Source-owned lambdas."
   [forms env]
-  (let [ctors (BeamLisp.Server/return_constructors)
-        ret-env (reduce (fn [e cname]
-                          (put-local e cname
-                                     (a/remote (erlang/binary_to_atom "Elixir.Map") :fetch!
-                                               (list (a/remote (kernel-mod-server-literal) :return_constructors (list))
-                                                     (a/lit cname)))))
-                        env (maps/keys ctors))]
+  (let [shapes (BeamLisp.Server/return_constructor_shapes)
+        ret-env (Enum/reduce (Map/to_list shapes) env
+                  (fn [entry e] (put-local e (elem entry 0) (server-constructor-node (elem entry 1)))))]
     (compile-body forms ret-env)))
 
 (defn- server-defn-clause [fname params guard body]
@@ -3509,25 +3532,40 @@
                   :origin :canonical-compiled-clauses :callbacks callbacks}]
     (concat checks (list (server-defn-clause :__bl_contract__ (list) nil (a/lit metadata))))))
 
-(defn- server-client-defs [mod]
+(defn- server-client-defs [mod env]
   (let [gs (erlang/binary_to_atom "Elixir.GenServer")
         remote (fn [m f xs] (a/remote m f (apply list (map (fn [name] (a/var name)) xs))))
         clause (fn [f ps body] (server-defn-clause f ps nil body))]
-    (list
+    (concat (list
       (clause :start (list "init_arg") (a/remote (kernel-mod-server-literal) :start (list (a/lit mod) (a/var "init_arg") (a/empty-list-node))))
       (clause :start (list "init_arg" "opts") (a/remote (kernel-mod-server-literal) :start (list (a/lit mod) (a/var "init_arg") (a/var "opts"))))
       (clause :start_link (list "init_arg") (a/remote (kernel-mod-server-literal) :start_link (list (a/lit mod) (a/var "init_arg") (a/empty-list-node))))
       (clause :start_link (list "init_arg" "opts") (a/remote (kernel-mod-server-literal) :start_link (list (a/lit mod) (a/var "init_arg") (a/var "opts"))))
+      )
+     ;; Managed Source uses SDK client boundaries. Its generated class must not
+     ;; carry unused raw OTP adapters: the exact IR audit rightly refuses them.
+     ;; The native/nonmanaged public client surface remains unchanged.
+     (if (:managed-source env) (list)
+      (list
       (clause :call (list "server" "request") (a/remote gs :call (list (a/var "server") (a/var "request") (a/lit 5000))))
       (clause :call (list "server" "request" "timeout") (remote gs :call (list "server" "request" "timeout")))
       (clause :cast (list "server" "request") (remote gs :cast (list "server" "request")))
       (clause :stop (list "server") (a/remote gs :stop (list (a/var "server") (a/lit :normal) (a/lit :infinity))))
       (clause :stop (list "server" "reason") (a/remote gs :stop (list (a/var "server") (a/var "reason") (a/lit :infinity))))
-      (clause :stop (list "server" "reason" "timeout") (remote gs :stop (list "server" "reason" "timeout"))))))
+      (clause :stop (list "server" "reason" "timeout") (remote gs :stop (list "server" "reason" "timeout"))))))))
 
-(defn- server-default-defs [cb]
+(defn- server-default-defs [cb module]
   (let [clause (fn [f ps body] (server-defn-clause f ps nil body))]
     (cond
+      (= cb :init)
+       (let [argument (fresh-var "bl_init_arg")
+             body (server-execution-body module :init (list) nil
+                    (a/tup (list (a/lit :ok) (a/lit {}))))]
+        ;; OTP still requires init/1 when the declaration has no user init.
+        ;; Claim the real start envelope before entering the same owned extent
+        ;; as an explicit initializer; an empty state grants no actor authority.
+        (list (clause :init (list argument)
+          (a/doo (list (a/remote (kernel-mod-server-literal) :bind_init (list (a/var argument))) body)))))
       (= cb :handle_call) (list (clause :handle_call (list "msg" "_from" "state") (a/tup (list (a/lit :stop) (a/tup (list (a/lit :bad_call) (a/var "msg"))) (a/var "state")))))
       (= cb :handle_cast) (list (clause :handle_cast (list "msg" "state") (a/tup (list (a/lit :stop) (a/tup (list (a/lit :bad_cast) (a/var "msg"))) (a/var "state")))))
       (= cb :handle_info) (list (clause :handle_info (list "_msg" "state") (a/tup (list (a/lit :noreply) (a/var "state")))))
@@ -3553,9 +3591,9 @@
                          (reverse (:cbs parts)))
         inv-defs (mapcat (fn [c] (server-clause-defs c :__invariant__ :vector (dissoc env :aot-normal-declaration-token) mod)) (reverse (:inv parts)))
         grouped (reduce (fn [m cd] (assoc m (first cd) (concat (get m (first cd) (list)) (second cd)))) {} clause-defs)
-        ordered (mapcat (fn [cb] (let [user (get grouped cb (list))] (if (empty? user) (server-default-defs cb) user)))
+        ordered (mapcat (fn [cb] (let [user (get grouped cb (list))] (if (empty? user) (server-default-defs cb mod) user)))
                         (BeamLisp.Server/callback_order))
-        module-defs (apply list (concat ordered inv-defs (server-client-defs mod) (server-contract-defs grouped)))
+        module-defs (apply list (concat ordered inv-defs (server-client-defs mod env) (server-contract-defs grouped)))
         exports (to-list (distinct (map (fn [d] [(:fname d) (count (:params d))]) module-defs)))
         descriptor (a/module mod module-defs exports (list [:behaviour (list :gen_server)]))
         create-node (a/remote (kernel-mod-body-lower-literal) :reload-descriptor! (list (a/lit descriptor)))]
@@ -4384,8 +4422,8 @@
     (vector? d)
       (let [vform (rn/->tuple
                     (list :vector
-                          (apply list (map (fn [value] (data->form value)) (BeamLisp.Vector/to_list d)))))
-            m (erlang/map_get :meta d)]
+                          (Enum/map (BeamLisp.Vector/to_list d) (fn [value] (data->form value)))))
+            m (maps/get :meta d nil)]
         (if (and (erlang/is_map m) (pos? (erlang/map_size m)))
           (rn/meta-node vform (metadata-data->forms m))
           vform))
@@ -4397,10 +4435,10 @@
     (set? d)
       (rn/->tuple (list :set
                         (lists/sort
-                          (apply list (map (fn [value] (data->form value)) (BeamLisp.Set/to_list d))))))
+                          (Enum/map (BeamLisp.Set/to_list d) (fn [value] (data->form value))))))
 
     (erlang/is_list d)
-      (rn/list-node (apply list (map (fn [value] (data->form value)) d)))
+      (rn/list-node (Enum/map d (fn [value] (data->form value))))
 
     ; a plain map (not one of the struct-backed values vector?/set? caught).
     ; SORTED by the reader-form key: an Erlang map enumerates atom keys in
@@ -4413,12 +4451,11 @@
         (list :map
               (lists/sort
                 (fn [a b] (erlang/=< (erlang/element 1 a) (erlang/element 1 b)))
-                (apply list
-                  (map (fn [kv]
-                         (erlang/list_to_tuple
-                           (list (data->form (erlang/element 1 kv))
-                                 (data->form (erlang/element 2 kv)))))
-                       (maps/to_list d))))))
+                (Enum/map (maps/to_list d)
+                  (fn [kv]
+                    (erlang/list_to_tuple
+                      (list (data->form (erlang/element 1 kv))
+                            (data->form (erlang/element 2 kv)))))))))
 
     ; a keyword is an atom other than nil/true/false; its node carries the name
     (and (erlang/is_atom d) (some? d) (not= d true) (not= d false))
@@ -4564,20 +4601,18 @@
                     (= "quote" (rn/node-name (rn/node-form (first items)))))))
           (list node m)
         (or (= tag :list) (= tag :vector) (= tag :set))
-          (let [r (reduce (fn [acc item]
-                            (let [x (renumber item (second acc))]
-                              (list (cons (first x) (first acc)) (second x))))
-                          (list (list) m)
-                          (rn/node-items node))]
-            (list (rn/->tuple (list tag (apply list (reverse (first r))))) (second r)))
+          (let [r (Enum/reduce (rn/node-items node) (list (list) m)
+                    (fn [item acc]
+                      (let [x (renumber item (second acc))]
+                        (list (cons (first x) (first acc)) (second x)))))]
+            (list (rn/->tuple (list tag (lists/reverse (first r)))) (second r)))
         (= tag :map)
-          (let [r (reduce (fn [acc pair]
-                            (let [k (renumber (kv-key pair) (second acc))
-                                  v (renumber (kv-val pair) (second k))]
-                              (list (cons (erlang/list_to_tuple (list (first k) (first v))) (first acc)) (second v))))
-                          (list (list) m)
-                          (rn/node-items node))]
-            (list (rn/->tuple (list :map (apply list (reverse (first r))))) (second r)))
+          (let [r (Enum/reduce (rn/node-items node) (list (list) m)
+                    (fn [pair acc]
+                      (let [k (renumber (kv-key pair) (second acc))
+                            v (renumber (kv-val pair) (second k))]
+                        (list (cons (erlang/list_to_tuple (list (first k) (first v))) (first acc)) (second v)))))]
+            (list (rn/->tuple (list :map (lists/reverse (first r)))) (second r)))
         :else (list node m)))))
 
 (defn- canonical-gensyms
@@ -4611,9 +4646,8 @@
   (canonical-gensyms
     (data->form
       (BeamLisp.Ns.Rt/invoke macro-fn
-        (apply list
-          (concat (list (datum form) (macro-env env))
-                  (map (fn [value] (datum value)) args)))))))
+        (erlang/++ (list (datum form) (macro-env env))
+                   (Enum/map args (fn [value] (datum value))))))))
 
 
 

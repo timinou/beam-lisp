@@ -1,7 +1,7 @@
 # The self-contained `bl` drop, built entirely inside nix (no network, no Mix).
 #
 # It runs the same sequence as .github/workflows/release.yml's linux leg
-# (deps -> bl build -> bl seed/check -> z3 -> bl self-build), with every input pinned and fetched
+# (deps -> prepare natives/app -> qualified floor check -> z3 -> self-build), with inputs pinned and fetched
 # by nix: hex tarballs (bl.lock digests), crates (Cargo.lock, vendored), the
 # pinned z3 zip and explorer's precompiled NIF. The toolchain (OTP 29, Elixir
 # 1.20, rustc, gcc) comes from the pinned nixpkgs, so every ELF the drop carries
@@ -156,7 +156,7 @@ let
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
-      ../bin ../priv ../env.bl ../bl.lock
+      ../bin ../priv ../env.bl ../bl.lock ../scripts/prepare-release.bl
       ../native/bl_json ../native/code_embed ../native/datom_datalog
       ../native/datom_fjall ../native/datom_vector ../native/lazy_memo
       ../tooling/drop/src ../tooling/drop/Cargo.toml ../tooling/drop/Cargo.lock
@@ -195,15 +195,17 @@ let
       mkdir -p priv/native
       install -m755 ${natives}/lazy_memo.so priv/native/lazy_memo.so
 
-      ./bin/bl deps verify
-      ./bin/bl deps compile
-      ./bin/bl build --force
-      # Pinned host leaves are loaded from the bootstrap floor, not repaired
-      # from priv/host on demand. Recompile that floor from this revision so
-      # native fixes cannot silently ship as source beside older executable
-      # host bytes. The next launcher stages and checks the regenerated floor.
-      ./bin/bl seed --ebin build
-      ./bin/bl seed --check
+      # Bootstrap commands use the source launcher directly. The native
+      # transport client is already built in drop-tools; compiling another
+      # client here would attempt a crates.io fetch inside the offline sandbox.
+      # Keep the provisioning verb first: the bare bootstrap can run before
+      # application dependencies exist. bin/bl recognizes --cold anywhere.
+      ./bin/bl deps verify --cold
+      ./bin/bl deps compile --cold
+      ./bin/bl --cold run scripts/prepare-release.bl
+      # Package the source-validated compiler floor. Compiler regeneration is
+      # a bare-VM operation, independent of the runtime's retained SDK lease.
+      ./bin/bl --cold seed --check
 
       # pinned z3, laid out as `bl install z3` leaves it
       unzip -q ${z3} -d $TMPDIR/z3
@@ -218,7 +220,7 @@ let
       chmod u+w $TMPDIR/launcher
       patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 --remove-rpath $TMPDIR/launcher
 
-      ./bin/bl self-build --bin $TMPDIR/launcher --out $TMPDIR/selfbuilt.drop --jobs $NIX_BUILD_CORES
+      ./bin/bl --cold self-build --reuse-floor --bin $TMPDIR/launcher --out $TMPDIR/selfbuilt.drop --jobs $NIX_BUILD_CORES
 
       # unpack, retarget every ELF at the FHS loader, repack with the same launcher
       $TMPDIR/drop unpack $TMPDIR/selfbuilt.drop --dir $TMPDIR/payload

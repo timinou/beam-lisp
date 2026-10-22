@@ -1,0 +1,99 @@
+; Native preparation evaluates only already-proved eager construction paths.
+; Inline exact fresh factories so their runtime Source entry is never invoked
+; during preparation. Delayed closures retain their ordinary Source ingress.
+(ns reload.initializer (:require [reload.native-call :as native-call]
+                                [reload.source-producer :as producer]))
+(defn inline
+ [expression factories]
+ (let [left (atom 8192)]
+  (letfn [(spend! [depth]
+           (when (or (> depth 32) (neg? (swap! left dec)))
+            (throw (ex-info "Initializer expansion exceeds its bound" {:kind :initializer-analysis-budget}))))
+          (invoke [clause args locals active depth]
+           (let [params (or (:params clause) (:pats clause))
+                 names (mapv (fn [_] (str "initializer_arg_" (erlang/unique_integer (list :positive)))) args)
+                 bound (reduce (fn [out [param argument]]
+                                (if (= :fn (:op argument)) (assoc out (:name param) argument)
+                                 (dissoc out (:name param)))) locals (map (fn [param arg] [param arg]) params args))
+                 body (walk (producer/initialization-body (:body clause)) bound active (inc depth))
+                 body (reduce (fn [out [param name]]
+                                {:op :let :name (:name param) :init {:op :var :name name :ann {}}
+                                 :body out :ann {}}) body (reverse (map (fn [param name] [param name]) params names)))]
+            ;; Evaluate every argument before binding ANY callee parameter.
+            (reduce (fn [out [name argument]]
+                      {:op :let :name name :init argument :body out :ann {}})
+                    body (reverse (map (fn [name arg] [name arg]) names args)))))
+          (factory [target args locals active depth original]
+           (let [clauses (get (:entries factories) target) clause (first clauses)]
+            (if (and (= 1 (count clauses)) (nil? (:guard clause))
+                     (= (count args) (count (:params clause)))
+                     (every? #(= :pvar (:pop %)) (:params clause))
+                     (not (contains? active target)))
+             (invoke clause args locals (conj active target) depth) original)))
+          (construction-callback [value locals active depth]
+           ;; Only the exact first-order SDK collection operations select this
+           ;; branch, after the entire initializer passed its construction proof.
+           ;; Their callback cannot escape the proved materialized data result.
+           (spend! depth)
+           (if-let [scaffold (BeamLisp.CompilerData/self_application_parts value)]
+            (assoc value :init
+             (assoc (:outer scaffold) :clauses
+              (list (assoc (:clause scaffold) :body
+                      (construction-callback (:inner scaffold) locals active (inc depth))))))
+            (case (:op value)
+             :fn (assoc value :clauses
+                  (to-list (mapv (fn [clause]
+                    (let [names (map :name (:pats clause))
+                          bound (reduce dissoc locals names)]
+                     (assoc clause :body
+                      (walk (producer/initialization-body (:body clause)) bound active (inc depth)))))
+                   (:clauses value))))
+             :var (if-let [closure (get locals (:name value))]
+                    (construction-callback closure locals active (inc depth)) value)
+             :global (let [target (get-in factories [:globals [(:ns value) (:name value)] 1])
+                           clauses (get (:entries factories) target) clause (first clauses)]
+                       (if (and (= 1 (count clauses)) (nil? (:guard clause)) (= 1 (count (:params clause))))
+                        (construction-callback
+                         {:op :fn :ann {} :clauses (list {:pats (:params clause) :guard nil :body (:body clause)})}
+                         locals (conj active target) (inc depth)) value))
+             :let (assoc value :body (construction-callback (:body value) locals active (inc depth)))
+             value)))
+          (parts [value locals active depth]
+           (cond
+            (map? value) (walk value locals active depth)
+            (vector? value) (mapv #(parts % locals active depth) value)
+            (erlang/is_list value) (to-list (mapv #(parts % locals active depth) value))
+            :else value))
+          (walk [n locals active depth]
+           (spend! depth)
+           (if-not (map? n) n
+            (let [n (or (native-call/original-source-call n) n)]
+             (case (:op n)
+              :lit n :fn n
+              :let (let [init (walk (:init n) locals active (inc depth))
+                         next (if (= :fn (:op init)) (assoc locals (:name n) init)
+                                (dissoc locals (:name n)))]
+                     (assoc n :init init :body (walk (:body n) next active (inc depth))))
+              :remote (let [args (to-list (mapv #(walk % locals active (inc depth)) (:args n)))
+                            target [(:mod n) (:fun n) (count args)]
+                            args (if (contains? #{:mapv :map} (get (:sdk factories) target))
+                                   (cons (construction-callback (first args) locals active (inc depth)) (rest args)) args)
+                            next (assoc n :args args)]
+                        (factory target args locals active depth next))
+              :apply (let [callee (:fn n) args (to-list (mapv #(walk % locals active (inc depth)) (:args n)))
+                           closure (if (= :var (:op callee)) (get locals (:name callee))
+                                     (when (= :fn (:op callee)) callee))
+                           clauses (:clauses closure) clause (first clauses)
+                           target (when (= :global (:op callee))
+                                    (get-in factories [:globals [(:ns callee) (:name callee)] (count args)]))]
+                       (cond
+                        target (factory target args locals active depth (assoc n :args args))
+                        (and (= 1 (count clauses)) (nil? (:guard clause))
+                             (= (count args) (count (:pats clause)))
+                             (every? #(= :pvar (:pop %)) (:pats clause)))
+                         (invoke clause args locals active depth)
+                        :else (assoc n :args args)))
+              (reduce (fn [out [key value]]
+                        (assoc out key (if (contains? #{:ann :meta :params :pats :pat :attrs :exports} key) value
+                                        (parts value locals active (inc depth))))) {} n)))))]
+   (walk expression {} #{} 0))))

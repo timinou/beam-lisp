@@ -41,7 +41,7 @@
 ; there is no shared mutable ground for one file to pull out from under another.
 
 (ns reload.ward
-  (:require [reload] [env] [proc.fence] [system.core :as sys] [z3] [bl.trace :as trace]))
+  (:require [reload.check :as check] [reload.runtime :as runtime] [env] [typed] [proc.fence] [bl.trace :as trace]))
 
 ;; ── coherence pre-check ───────────────────────────────────────────────────
 
@@ -51,7 +51,7 @@
    Runs the file's declared namespace through reload's own coherence pass, so a
    test file that references an undefined var is reported, never crashes the run."
   [ns src]
-  (reload/coherence {ns src}))
+  (check/coherence {ns src}))
 
 ;; ── run one file in an isolated fork ──────────────────────────────────────
 
@@ -59,7 +59,7 @@
   "The namespace a test file declares (its leading `(ns …)`). We read it via the
    reader so a file with no `(ns …)` is reported cleanly rather than mis-run."
   [src]
-  (reload/declared-ns src))
+  (check/declared-ns src))
 
 (defn- missing-namespace-error
   "A missing declaration and malformed source are different failures. Parse
@@ -130,12 +130,10 @@
     (if (empty? procs)
       nil
       (try
-        (let [port (z3/open)]                 ; raises if z3 is not fetched
-          (some (fn [node]
-                  (let [r (sys/repair-process port node)]
-                    (if (and (:checked r) (seq (:repairs r))) r nil)))
-                procs))
-        (catch _ nil)))))                       ; z3 absent / untranslatable → no Tier B
+        (do
+          (BeamLisp.Loader/ensure_loaded "reload.ward-diagnosis")
+          ((BeamLisp.Env/fetch_exact! "reload.ward-diagnosis" "diagnose") procs))
+        (catch _ nil)))))
 (def DEFAULT-WORKER-BOUND-MS 300000)
 
 (defn worker-bound-ms
@@ -217,16 +215,18 @@
         line (when crash (:line crash))
         frames (load-frames (if crash (:stack crash) stack) 8)]
     (cond-> {:kind :load-crash
-             :msg (str "crashed while loading: " (ex-message cause))}
+             :msg (str "crashed while loading: " (ex-message cause))
+             :data (try (ex-data cause) (catch _ nil))}
       (and (some? path) (some? line)) (assoc :at (str path ":" line))
       (seq frames) (assoc :frames frames))))
 
-(defn- evaluate-file [scope src ns warns path]
+(defn- evaluate-file [scope src ns path]
   (env/with-env scope
     (fn []
-      (reload/with-target scope
+      (runtime/with-target scope
         (fn []
           (try
+           (let [warns (check-source ns src)]
             (BeamLisp.TestRT/declarations
               (fn [] (if (some? path) (load-source! src path) (env/eval src))))
             (let [result (BeamLisp.TestRT/run_ns ns)
@@ -236,9 +236,9 @@
                   failed? (not (and (= 0 (:fail totals)) (= 0 (:error totals))))]
               {:ns ns :status (if failed? :failed :passed) :totals totals
                :reports (vec failures) :repair (when failed? (diagnose-processes src))
-               :warnings warns})
+               :warnings warns}))
             (catch e
-              {:ns ns :status :incoherent :warnings warns
+              {:ns ns :status :incoherent :warnings []
                :errors [(load-crash-error e __STACKTRACE__ path)]})))))))
 
 (defn run-file
@@ -255,13 +255,13 @@
   (let [ns (ns-of src)]
     (if (nil? ns)
       {:ns nil :status :incoherent :errors [(missing-namespace-error src)]}
-      (let [warns (check-source ns src) scope (env/fork base)
+      (let [scope (env/fork base)
             env-token (env/capture) me (erlang/self) bound (worker-bound-ms ns)]
         (try
           (let [started (BeamLisp.Refs/spawn_owned
                           (fn []
                             (env/bind env-token)
-                            (let [result (evaluate-file scope src ns warns path)]
+                            (let [result (evaluate-file scope src ns path)]
                               (erlang/send me [:ward-result (erlang/self) result])))
                           :monitor (list))
                 worker (elem started 0) monitor (elem started 1)]
@@ -269,19 +269,20 @@
               [:ward-result observed r] :when (= observed worker)
                 (do (erlang/demonitor monitor (list :flush)) r)
               [:DOWN observed :process pid reason] :when (and (= observed monitor) (= pid worker))
-                {:ns ns :status :incoherent :warnings warns
+                {:ns ns :status :incoherent :warnings []
                  :errors [{:kind :worker-exit
                            :msg (str "test worker exited before reporting: " (pr-str reason))}]}
               (after bound
-                (do
+                (let [diagnostic (Process/info worker (list :current_stacktrace :current_function
+                                                     :status :reductions :memory :message_queue_len))]
                   (erlang/exit worker :kill)
                   (receive
                     [:DOWN observed :process pid _] :when (and (= observed monitor) (= pid worker)) :ok)
                   ;; A result sent just before the deadline may precede DOWN.
                   ;; Flush only this worker's result; foreign mailbox data stays.
                   (receive [:ward-result observed _] :when (= observed worker) :ok (after 0 nil))
-                  {:ns ns :status :incoherent :warnings warns
-                   :errors [{:kind :timeout :msg "test worker timed out"}]}))))
+                  {:ns ns :status :incoherent :warnings []
+                   :errors [{:kind :timeout :msg "test worker timed out" :diagnostic diagnostic}]}))))
           (finally (env/destroy scope))))))))
 
 ;; ── run a suite of files ──────────────────────────────────────
@@ -425,9 +426,9 @@
                   (erlang/apply :os :getenv (list)))]
     (let [k (subs kv 0 (index-of kv "="))]
       (when-not (contains? snap k)
-        (System/delete_env k))))
+        (erlang/apply :Elixir.System :delete_env (list k)))))
   (doseq [k (keys snap)]
-    (System/put_env k (get snap k))))
+    (erlang/apply :Elixir.System :put_env (list k (get snap k)))))
 
 (defn- run-file-eventful
   "Run one file, firing `:file-start` (with the file's ns, read before the fork)
@@ -456,6 +457,9 @@
                           :msg (or (entry-note entry) "source could not be read")}]}
                (try
                  (run-file base (prep src) path)
+                 (catch e
+                  {:ns ns :status :incoherent :warnings []
+                   :errors [(load-crash-error e __STACKTRACE__ path)]})
                  (finally (restore-os-env! before))))
           r (named (fix r0 ns) path)]
       (emit! on-event r))))
@@ -493,13 +497,20 @@
     identical behaviour, so existing callers are untouched. The two phases are how
     a live dashboard shows a tile go from running to resolved."
    ([sources] (run sources nil))
-    ([sources on-event]
-     (let [base (warm-base)]
-       (try
-         (summarize
-           (map (fn [src] (run-file-eventful base src on-event identity (fn [r _ns] r)))
-                sources))
-         (finally (env/destroy base))))))
+   ([sources on-event] (run sources on-event {}))
+   ([sources on-event options]
+    (let [base (warm-base) continue? (:continue? options)]
+     (try
+      ;; Consume once without memoized lazy result cells retaining earlier
+      ;; source/result graphs. A host may hand over between complete files;
+      ;; it never interrupts a file or counts unrun input as success.
+      (loop [remaining sources results []]
+       (cond
+        (empty? remaining) (summarize results)
+        (and continue? (not (continue?))) (assoc (summarize results) :stopped? true)
+        :else (recur (rest remaining)
+                (conj results (run-file-eventful base (first remaining) on-event identity (fn [r _ns] r))))))
+      (finally (env/destroy base))))))
 
 ;; ── concurrency-sound sandboxing ──────────────────────────────────────────
 ;;
