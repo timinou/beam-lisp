@@ -1,0 +1,128 @@
+; Kernel browser lifecycle. Wire contract: kernel/kernel-node-sdk resources/browsers.
+; A credential is resolved only for a request and is never stored as printable data.
+(ns browser.kernel (:require [interop] [connector.transport :as transport]))
+(def default-base-url "https://api.onkernel.com")
+(def default-api-key-env "KERNEL_API_KEY")
+(def default-base-url-env "KERNEL_BASE")
+(defn- error [reason fields] {:error (assoc fields :reason reason)})
+(defn- unwrap! [r]
+ (if (contains? r :ok) (:ok r)
+  (throw (ex-info (str "Kernel " (name (get-in r [:error :reason])) " "
+                       (or (get-in r [:error :message]) (get-in r [:error :status]) "")) (:error r)))))
+(defn client
+ ([] (client {}))
+ ([opts]
+  (when-not (contains? #{nil :kernel "kernel"} (:provider opts))
+   (throw (ex-info "Unsupported browser provider" {:reason :invalid-provider})))
+  (let [literal (:api-key opts) variable (or (:api-key-env opts) default-api-key-env)
+        base (String/trim_trailing (or (:base-url opts) (System/get_env default-base-url-env) default-base-url) "/")
+        uri (URI/parse base)]
+   (when-not (and (contains? #{"http" "https"} (:scheme uri)) (some? (:host uri))
+                  (nil? (:userinfo uri)) (nil? (:query uri)) (nil? (:fragment uri)))
+    (throw (ex-info "Invalid Kernel base URL" {:reason :invalid-base})))
+   (assoc (dissoc opts :api-key) :provider :kernel :base-url base :api-key-env variable
+          :timeout-ms (or (:timeout-ms opts) 30000)
+          :credential (fn [] (or literal (System/get_env variable)))))))
+(defn api-base [c] (:base-url c))
+(defn header [r key]
+ (let [value (some (fn [[k v]] (when (= (String/downcase (str k)) (String/downcase key)) v)) (:headers r))]
+  (if (string? value) value (first value))))
+(defn- redact [value secret]
+ (cond
+  (string? value) (String/replace value secret "[redacted]")
+  (map? value) (into {} (map (fn [[k v]] [k (redact v secret)]) value))
+  (vector? value) (mapv #(redact % secret) value)
+  (list? value) (map #(redact % secret) value)
+  :else value))
+(defn- send! [c req]
+ (if-let [f (:transport c)] (interop/result (f req))
+  (let [r (transport/request! {:method (get {"GET" :get "POST" :post "PUT" :put "PATCH" :patch "DELETE" :delete "HEAD" :head "OPTIONS" :options} (:method req))
+                              :url (:url req) :headers (:headers req) :body (:body req)
+                              :encoding :bytes :decode :bytes :timeout-ms (:timeout-ms c)
+                              :max-bytes 67108864})]
+   (if (:error r) {:error (:error r)} {:ok r}))))
+(defn request [c method path opts]
+ (cond
+  (not (and (string? path) (String/starts_with? path "/") (not (String/starts_with? path "//"))
+             (not (Regex/match? (Regex/compile! "[\\x00-\\x20\\x7f]") path)))) (error :invalid-path {})
+  (not (contains? #{"GET" "POST" "PUT" "PATCH" "DELETE" "HEAD" "OPTIONS"} method)) (error :invalid-method {})
+  :else
+   (let [key ((:credential c))]
+    (if-not (and (string? key) (not= "" key)) (error :missing-api-key {:env (:api-key-env c)})
+     (try
+      (let [url (str (api-base c) path)
+            req {:method method :url url :headers {"authorization" (str "Bearer " key) "content-type" "application/json"}
+                 :body (when (contains? opts :body) (interop/->json (:body opts)))}
+            response (send! c req)]
+       (if (contains? response :error) (error :transport {:message (redact (str (:error response)) key)})
+        (let [r (:ok response) bytes (:body r)
+              body (if (and (string? bytes) (not= "" bytes)) (try (interop/json-> bytes) (catch _ bytes)) bytes)
+              r (assoc r :url url :body (redact body key))]
+         (if (and (>= (:status r) 200) (< (:status r) 300)) {:ok r}
+          (error :http-status (select-keys r [:url :status :body]))))))
+      (catch e (error :transport {:message (redact (str e) key)})))))))
+(defn request! [c method path opts] (unwrap! (request c method path opts)))
+(defn- session-id [s] (if (string? s) s (:session-id s)))
+(defn- token? [s] (and (string? s) (Regex/match? (Regex/compile! "^[A-Za-z0-9_-]+$") s)))
+(defn- session-path! [s]
+ (let [id (session-id s)] (if (token? id) (str "/browsers/" id)
+  (throw (ex-info "Kernel needs a session ID" {:reason :no-session})))))
+(defn create
+ ([c] (create c {}))
+ ([c opts]
+  (let [known #{:stealth :viewport :timeout-seconds :start-url :session}
+        unknown (vec (sort (remove known (keys opts)))) viewport (:viewport opts)]
+   (cond
+    (seq unknown) (error :unknown-option {:keys unknown})
+    (and viewport (not (and (integer? (:width viewport)) (pos? (:width viewport))
+                            (integer? (:height viewport)) (pos? (:height viewport))))) (error :invalid-option {:option :viewport})
+    :else
+     (let [body (merge (:session c) (:session opts)
+                 (into {} (map (fn [[k v]] [(get {:timeout-seconds :timeout_seconds :start-url :start_url} k k) v]) (dissoc opts :session))))
+           r (request c "POST" "/browsers" {:body body}) b (get-in r [:ok :body])]
+      (if (:error r) r (if (and (map? b) (token? (get b "session_id")))
+       {:ok (assoc b :session-id (get b "session_id") :base-url (get b "base_url"))}
+       (error :malformed-response {}))))))))
+(defn create! ([c] (unwrap! (create c))) ([c opts] (unwrap! (create c opts))))
+(defn close! [c session]
+ (let [r (request c "DELETE" (session-path! session) {})]
+  (if (= 404 (get-in r [:error :status])) true (do (unwrap! r) true))))
+(defn playwright
+ ([c session code] (playwright c session code {:timeout-sec 60}))
+ ([c session code opts]
+  (let [timeout (:timeout-sec opts)]
+   (cond
+    (not (token? (session-id session))) (error :no-session {})
+    (not (and (integer? timeout) (<= 1 timeout 300))) (error :invalid-timeout {})
+    :else
+     (let [r (request c "POST" (str (session-path! session) "/playwright/execute") {:body {:code code :timeout_sec timeout}})
+           b (get-in r [:ok :body])]
+      (cond (:error r) r
+            (= true (get b "success")) {:ok (get b "result")}
+            (= false (get b "success")) (error :playwright {:message (get b "error") :error (get b "error") :stderr (get b "stderr") :stdout (get b "stdout")})
+            :else (error :malformed-response {})))))))
+(defn playwright! ([c s code] (unwrap! (playwright c s code))) ([c s code opts] (unwrap! (playwright c s code opts))))
+(defn replay-start!
+ ([c s] (replay-start! c s {}))
+ ([c s opts]
+  (when (and (:framerate opts) (not (and (integer? (:framerate opts)) (pos? (:framerate opts)))))
+   (throw (ex-info "Invalid replay framerate" {:reason :invalid-option})))
+  (let [body (into {} (map (fn [[k v]] [(if (= k :max-duration-seconds) :max_duration_in_seconds k) v]) opts))
+        b (:body (request! c "POST" (str (session-path! s) "/replays") {:body body}))]
+   (if (token? (get b "replay_id")) (assoc b :replay-id (get b "replay_id"))
+    (throw (ex-info "Replay ID missing" {:reason :malformed-response}))))))
+(defn- replay-path! [s id]
+ (when-not (token? id) (throw (ex-info "Replay ID missing" {:reason :no-replay})))
+ (str (session-path! s) "/replays/" id))
+(defn replay-stop! [c s id] (request! c "POST" (str (replay-path! s id) "/stop") {}) true)
+(defn replays [c s] (:body (request! c "GET" (str (session-path! s) "/replays") {})))
+(defn replay-download! [c s id]
+ (let [r (request! c "GET" (replay-path! s id) {})]
+  (if (= 202 (:status r)) (throw (ex-info "Replay is still recording" {:reason :replay-pending})) (:body r))))
+(defn with-session
+ ([c action] (with-session c {} action))
+ ([c opts action]
+  (let [s (create! c opts) result (try {:ok (action s)} (catch e {:error e}))]
+   (if (contains? result :error)
+    (do (try (close! c s) (catch _ nil)) (throw (:error result)))
+    (do (close! c s) (:ok result))))))
