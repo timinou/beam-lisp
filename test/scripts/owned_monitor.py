@@ -49,6 +49,10 @@ true=Process.alive?(Process.whereis(BeamLisp.Env))
 BeamLisp.Env.destroy(scope)
 try do BeamLisp.Env.resolve_native_context!(token);raise "retired context accepted"
 rescue e in ErlangError -> :retired_native_context=e.original end
+try do
+ BeamLisp.Loader.Server.agent_get_and_update(self(),fn state -> {:forged,state} end,100)
+ raise "unattested SDK Agent action accepted"
+rescue e in ErlangError -> :unattested_sdk_callback=e.original end
 port=Port.open({:spawn_executable, String.to_charlist(System.fetch_env!("BL_KERNEL_PYTHON"))},
                [:binary, :exit_status, args: [System.fetch_env!("BL_KERNEL_FAKE_SOLVER")]])
 try do
