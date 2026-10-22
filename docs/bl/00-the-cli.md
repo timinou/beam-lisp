@@ -960,6 +960,7 @@ Every variable `bl` reads, once. A preference belongs in `env.bl`, `~/.config/bl
 | `BEAM_LISP_DEV` / `BEAM_LISP_RELOAD` / `BEAM_LISP_IMAGE` | declaration | what a tree says about itself to the reloader and the image builder |
 | `BEAM_LISP_MODEL_DIR` | override | where the embedding model's weights live |
 | `BEAM_LISP_Z3` / `BEAM_LISP_Z3_FORCE` | workaround | z3 provisioning (to be fixed, then deleted) |
+| `BL_PROFILE_SEAMS` / `BL_PROFILE_TRACE` | diagnostic | record runtime seam timings and native trace profiles |
 | `BEAM_LISP_NIF_TRACE` | test | trace native calls |
 | `BL_USE` | override | the build to run here, overriding every other rule (`stable`, `latest`, `commit:SHA`, …) |
 | `BL_BUILD` | override | `never`: a missing build fails instead of being fetched or built |
