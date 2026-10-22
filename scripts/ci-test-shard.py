@@ -52,7 +52,7 @@ def main():
     # executes its files serially under a cap, including any child processes.
     command = ["systemd-run", "--user", "--collect", "--wait", "--pipe", "--quiet",
                f"--working-directory={root}", "--property=MemoryMax=6G",
-               "--property=MemorySwapMax=0", "--property=RuntimeMaxSec=2700",
+               "--property=MemorySwapMax=0", "--property=RuntimeMaxSec=5400",
                f"--setenv=PATH={os.environ.get('PATH', '')}",
                "--setenv=BL_TEST_TIMES=1",
                sys.executable, str(root / "scripts/qualify-candidate.py"),
@@ -82,7 +82,8 @@ def main():
                     continue
                 try:
                     if (f"XDG_RUNTIME_DIR={runtime}".encode() + b"\0" in (proc / "environ").read_bytes()
-                            and b"beam_lisp" in (proc / "cmdline").read_bytes()):
+                            and any(name in (proc / "cmdline").read_bytes().lower()
+                                    for name in (b"beam_lisp", b"beamlisp."))):
                         owned.append(int(proc.name))
                         os.kill(int(proc.name), signal.SIGTERM)
                 except (FileNotFoundError, ProcessLookupError, PermissionError):

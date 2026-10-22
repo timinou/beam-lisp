@@ -60,7 +60,8 @@ def stop_children(runtime):
     for process in Path("/proc").glob("[0-9]*"):
         try:
             if (f"XDG_RUNTIME_DIR={runtime}".encode() + b"\0" in (process / "environ").read_bytes()
-                    and b"beam_lisp" in (process / "cmdline").read_bytes()):
+                    and any(name in (process / "cmdline").read_bytes().lower()
+                            for name in (b"beam_lisp", b"beamlisp."))):
                 pid = int(process.name)
                 os.kill(pid, signal.SIGTERM)
                 owned.append(pid)
@@ -76,6 +77,23 @@ def stop_children(runtime):
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+
+def process_groups(files, isolated):
+    warm = [name for name in files if name not in isolated]
+    return ([warm] if warm else []) + [[name] for name in files if name in isolated]
+
+
+def separate_last_record(path):
+    """Preserve an interrupted record while keeping the next append parseable."""
+    if path.exists() and path.stat().st_size:
+        with path.open("rb+") as stream:
+            stream.seek(-1, os.SEEK_END)
+            if stream.read(1) != b"\n":
+                stream.seek(0, os.SEEK_END)
+                stream.write(b"\n")
+                stream.flush()
+                os.fsync(stream.fileno())
 
 
 def main():
@@ -104,34 +122,60 @@ def main():
                      "BL_CHECKOUT_ROOT", "BL_CHECKOUT_COLD", "BL_CHECKOUT_GENERATION",
                      "BL_CHECKOUT_SOURCE_GENERATION", "BEAM_LISP_PATH"):
             env.pop(name, None)
-        # A private endpoint directory also contains any child checkout daemons.
-        with tempfile.TemporaryDirectory(prefix="bl-qualify-") as runtime:
-            env["XDG_RUNTIME_DIR"] = runtime
-            command = [str(candidate), "--cold", "run", str(ROOT / "scripts/qualify-candidate.bl")]
-            with args.results.open("a", buffering=1) as receipts:
-                process = subprocess.Popen(command, cwd=ROOT, env=env, text=True,
-                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                try:
-                    for line in process.stdout:
-                        print(line, end="", flush=True)
-                        if line.startswith("BL-QUALIFY "):
-                            row = json.loads(line.removeprefix("BL-QUALIFY "))
-                            row["identity"] = identity
-                            receipts.write(json.dumps(row, sort_keys=True) + "\n")
-                            receipts.flush()
-                            os.fsync(receipts.fileno())
-                    status = process.wait()
-                    receipts.write(json.dumps({"type": "batch", "identity": identity,
-                                               "process_status": status}) + "\n")
-                    receipts.flush()
-                    os.fsync(receipts.fileno())
-                finally:
-                    if process.poll() is None:
-                        process.terminate()
-                        process.wait()
-                    stop_children(runtime)
-            if status not in (0, 1):
-                print(f"Candidate process failed with status {status}", flush=True)
+        isolated = json.loads((ROOT / "scripts/test-isolation.json").read_text())
+        groups = process_groups(pending, isolated)
+        status = 0
+        separate_last_record(args.results)
+        with args.results.open("a", buffering=1) as receipts:
+            while groups:
+                selected = groups.pop(0)
+                env["BL_QUALIFY_FILES"] = "\n".join(selected)
+                reported, handover = set(), False
+                # Each process owns its endpoint directory. Lifetime handovers and
+                # privileged fixtures stay serial inside the caller's tree cap.
+                with tempfile.TemporaryDirectory(prefix="bl-qualify-") as runtime:
+                    env["XDG_RUNTIME_DIR"] = runtime
+                    command = [str(candidate), "--cold", "run", str(ROOT / "scripts/qualify-candidate.bl")]
+                    process = subprocess.Popen(command, cwd=ROOT, env=env, text=True,
+                                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                    try:
+                        for line in process.stdout:
+                            print(line, end="", flush=True)
+                            if line.startswith("BL-QUALIFY "):
+                                row = json.loads(line.removeprefix("BL-QUALIFY "))
+                                if row.get("file") not in selected:
+                                    raise RuntimeError("Candidate reported an unrequested test file")
+                                reported.add(row["file"])
+                                row["identity"] = identity
+                                receipts.write(json.dumps(row, sort_keys=True) + "\n")
+                                receipts.flush()
+                                os.fsync(receipts.fileno())
+                            elif line.startswith("BL-QUALIFY-HANDOVER "):
+                                row = json.loads(line.removeprefix("BL-QUALIFY-HANDOVER "))
+                                handover = True
+                                receipts.write(json.dumps({"type": "handover", "identity": identity,
+                                                           **row}) + "\n")
+                        current_status = process.wait()
+                        status = status or current_status
+                        receipts.write(json.dumps({"type": "process", "identity": identity,
+                                                   "files": selected, "process_status": current_status}) + "\n")
+                        receipts.flush()
+                        os.fsync(receipts.fileno())
+                    finally:
+                        if process.poll() is None:
+                            process.terminate()
+                            process.wait()
+                        process.stdout.close()
+                        stop_children(runtime)
+                remaining = [name for name in selected if name not in reported]
+                if handover and reported and remaining and current_status in (0, 1):
+                    groups.insert(0, remaining)
+                if current_status not in (0, 1):
+                    print(f"Candidate process failed with status {current_status}", flush=True)
+            receipts.write(json.dumps({"type": "batch", "identity": identity,
+                                       "process_status": status}) + "\n")
+            receipts.flush()
+            os.fsync(receipts.fileno())
     rows = completed(args.results, identity)
     missing = [name for name in files if name not in rows]
     failed = [name for name in files if name in rows and rows[name]["fail"] + rows[name]["error"]]

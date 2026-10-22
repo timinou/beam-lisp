@@ -3,8 +3,8 @@
               {vsn,"0.1.0"},
               {modules,[]},
               {registered,[]},
-              {applications,[kernel,stdlib,elixir,logger,ssh,x509,bandit,
-                             websock_adapter,file_system,explorer,req,
-                             aws_signature,jason]},
+              {applications,[kernel,stdlib,elixir,logger,ssh,runtime_tools,
+                             x509,bandit,websock_adapter,file_system,explorer,
+                             req,aws_signature,jason]},
               {mod,{'Elixir.BeamLisp.Application',[]}},
               {env,[]}]}.

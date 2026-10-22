@@ -380,6 +380,13 @@ function writeText(text) {
   else console.log(text.endsWith("\n") ? text.slice(0, -1) : text);
 }
 export const IO = {
+  "io/put_chars/2": (device, chars) => {
+    const text = iolist(chars), name = device?.fq;
+    if (name === "standard_error") { if (typeof process !== "undefined" && process.stderr?.write) process.stderr.write(text); else console.error(text); }
+    else if (name === "standard_io") writeText(text);
+    else badarg("put_chars device");
+    return kw("ok");
+  },
   "io/format/2": (format, args) => {
     // These are the Unicode text formats shared rt.bl's printer requests.
     // Value formatting remains entirely in BL, not in this output primitive.
@@ -395,6 +402,15 @@ export const IO = {
 
 const beamOnly = (k) => () => { throw new BLError(k + " runs on the BEAM only (not part of the JS target)"); };
 export const BEAM_ONLY = Object.fromEntries([
+  // Compiler hooks remain resolvable in shared code. function_exported is
+  // false on JS, and explicit use cannot manufacture BEAM custody/metadata.
+  "Elixir.BeamLisp.AOT/constructor_metadata_compiling?/0",
+  "Elixir.BeamLisp.AOT/sdk_declaration_kind/2",
+  "Elixir.BeamLisp.AOT/staged_macro_kind/2",
+  "Elixir.BeamLisp.AOT/staged_macro_lookup/2",
+  "Elixir.BeamLisp.Env/assert_native_framework_execution!/0",
+  "Elixir.BeamLisp.Record/declaration_descriptor/4",
+  "Elixir.BeamLisp.Record/declaration_kind/3",
   "erlang/monitor/2", "erlang/exit/2",
   "Elixir.Code/ensure_loaded?/1", "crypto/hash/2", "Elixir.Base/encode16/1",
   "Elixir.BeamLisp.Trace/trace/3", "Elixir.BeamLisp.Trace/trace/4", "Elixir.BeamLisp.Trace/untrace/2",

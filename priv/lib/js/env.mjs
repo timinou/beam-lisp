@@ -93,6 +93,7 @@ const varRow = (n, s) => key(T(n, s));
 const linkRow = (n, s) => key(T(kw("link"), n, s));
 
 export const ENV = {
+  env_id: () => R.list(R.kw("global")),
   current_ns: () => CURRENT_NS,
   in_ns: (ns) => { CURRENT_NS = ns; putKey(T(kw("ns"), ns), true); return OK; },
   declare_ns: (ns) => putKey(T(kw("ns"), ns), true),

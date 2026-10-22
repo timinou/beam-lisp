@@ -20,6 +20,12 @@ class TestVmDiscovery(unittest.TestCase):
         self.assertEqual(("test", "--cold test one.bl"), MEMORY.kind_and_args(launcher))
         self.assertEqual(("other", "Elixir driver check.exs"), MEMORY.kind_and_args(component))
 
+    def test_packed_drop_entry_owns_memory_and_keeps_its_command(self):
+        command = ["/drop/erts/bin/beam.smp", "--eval",
+                   "BeamLisp.Launcher.start_app!(System.argv(), %{})", "--", "--cold", "run", "check.bl"]
+        self.assertTrue(MEMORY.beam_lisp_vm(command))
+        self.assertEqual(("run", "--cold run check.bl"), MEMORY.kind_and_args(command))
+
     def test_parents_and_unrelated_elixir_vms_are_not_counted(self):
         for command in (["bash", "-c", "elixir -e BeamLisp.Launcher.main()"],
                         ["systemd-run", "-pa", "/private/lib/beam_lisp-0.1.0/ebin"],
